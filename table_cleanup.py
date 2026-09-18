@@ -2,10 +2,12 @@
 table_cleanup.py — scan the table, then pick up and drop every object
 classified as trash into a fixed drop location.
 
-Reuses table_scan's connect/capture/classify/validate/localize to identify
-what's on the table and where each object sits in world-frame mm. For each
-object marked trash, if its 3D position is trustworthy, the gripper:
-  1. moves to a safe transit height above the object,
+Reuses table_scan's connect/capture/scan to identify what's on the table and
+where each object sits in world-frame mm. For each
+object marked trash, if its 3D position is trustworthy and it fits between
+the jaws, the gripper:
+  1. moves to a safe transit height above the object, turned so the jaws
+     will close across the object's narrow side,
   2. descends in a straight line to the grasp point,
   3. grabs, and confirms it actually holds something,
   4. lifts straight back up, moves over the drop pose, descends, releases,
@@ -26,7 +28,7 @@ There is no confirmation prompt: this script scans and immediately acts on
 whatever it classifies as trash. Ctrl-C stops the arm where it is.
 
 Setup: same as table_scan.py — .env populated, .venv/bin/pip install
-       viam-sdk anthropic python-dotenv numpy
+       viam-sdk anthropic python-dotenv numpy pillow
 
 Run:
     .venv/bin/python table_cleanup.py             # scan, then act
@@ -63,9 +65,7 @@ import table_scan as ts
 # gripper target at height z puts the fingertips at z - CLAW_REACH_MM.
 CLAW_REACH_MM = 50.0
 
-# The `table` obstacle is a 200mm-tall box whose frame sits at z=-123, so its
-# top surface — where every object rests — is at z=-23.
-TABLE_TOP_Z_MM = -23.0
+TABLE_TOP_Z_MM = ts.TABLE_TOP_Z_MM
 
 # --- Motion constants -------------------------------------------------------
 # All heights below are for the gripper frame, not the arm flange.
@@ -75,9 +75,19 @@ GRASP_TABLE_CLEARANCE_MM = 10.0   # never plan fingertips closer than this to th
 OBSTACLE_PADDING_MM = 10.0        # grow each object's box by this on every side
 MOVE_TIMEOUT_S = 60.0
 
-# Top-down orientation used for every synthetic pick/drop pose — the end
-# effector points straight down (o_z=-1), no roll (theta=0).
+# Every synthetic pick/drop pose points the end effector straight down
+# (o_z=-1); theta is the roll about that axis and is chosen per object.
 DOWN = dict(o_x=0.0, o_y=0.0, o_z=-1.0, theta=0.0)
+
+# Pointing straight down, the gripper frame's y axis lies at world yaw
+# 90 - theta (checked against the machine's frame system at several thetas).
+# The jaws close along the gripper's y axis, confirmed on the real arm. If
+# they ever close along x instead, set this to 90.
+JAW_AXIS_OFFSET_DEG = 0.0
+
+# Inner gap between the fully open jaws, measured on the real gripper.
+# Objects wider than this across their narrow side are skipped, not attempted.
+GRIPPER_MAX_OPENING_MM = 85.0
 
 # Vertical approaches and retreats run close to neighbouring objects, so they
 # go in a straight line rather than wherever the planner's path wanders.
@@ -136,7 +146,24 @@ def gate(position: dict | None) -> str | None:
         return f"implausible size {position['size']} mm"
     if position["max"][2] <= TABLE_TOP_Z_MM:
         return f"reads as below the table surface (top z={position['max'][2]} mm)"
+    if position["width_mm"] > GRIPPER_MAX_OPENING_MM:
+        return (f"too wide for the gripper ({position['width_mm']:.0f} mm across "
+                f"its narrow side, jaws open {GRIPPER_MAX_OPENING_MM:.0f} mm)")
     return None
+
+
+def grasp_theta(position: dict) -> float:
+    """Gripper roll that closes the jaws across the object's narrow side.
+
+    Jaws close along world yaw 90 - theta + JAW_AXIS_OFFSET_DEG; that must be
+    perpendicular to the long axis, i.e. long_axis + 90. Solving gives
+    theta = JAW_AXIS_OFFSET_DEG - long_axis. The jaws are symmetric, so theta
+    and theta + 180 grip the same way; keep the one within 90 degrees of the
+    home roll, so the wrist never spins half a turn for nothing.
+    """
+    theta = JAW_AXIS_OFFSET_DEG - position["long_axis_deg"]
+    lo = HOME_POSE.theta - 90.0
+    return lo + (theta - lo) % 180.0
 
 
 def resting_box(position: dict) -> tuple[list, list]:
@@ -179,8 +206,8 @@ def world_state(objs: list[dict]) -> WorldState:
     )
 
 
-def down_at(x: float, y: float, z: float) -> Pose:
-    return Pose(x=x, y=y, z=z, **DOWN)
+def down_at(x: float, y: float, z: float, theta: float = 0.0) -> Pose:
+    return Pose(x=x, y=y, z=z, **{**DOWN, "theta": theta})
 
 
 @dataclass
@@ -223,10 +250,14 @@ async def pick_and_drop(rig: Rig, obj: dict, world: WorldState) -> tuple[str, bo
     with the object still in the gripper.
     """
     x, y, z = grasp_point(obj["position"])
+    # Turn to the grasp roll up at transit height, then hold it all the way
+    # through: the descent is a straight line that allows only 5 degrees of
+    # rotation, and there's no reason to twist a held object before the drop.
+    th = grasp_theta(obj["position"])
 
-    if not await move(rig, down_at(x, y, SAFE_HEIGHT_MM), "transit above object", world):
+    if not await move(rig, down_at(x, y, SAFE_HEIGHT_MM, th), "transit above object", world):
         return "move to transit-above-object failed", False
-    if not await move(rig, down_at(x, y, z), "grasp", world, straight=True):
+    if not await move(rig, down_at(x, y, z, th), "grasp", world, straight=True):
         return "descent to grasp point failed", False
 
     grabbed = await rig.gripper.grab()
@@ -234,21 +265,22 @@ async def pick_and_drop(rig: Rig, obj: dict, world: WorldState) -> tuple[str, bo
     if not grabbed or not holding:
         # Reopen so the next object isn't approached with closed jaws.
         await rig.gripper.open()
-        await move(rig, down_at(x, y, SAFE_HEIGHT_MM), "retreat after failed grab",
+        await move(rig, down_at(x, y, SAFE_HEIGHT_MM, th), "retreat after failed grab",
                    world, straight=True)
         return f"grab failed (grab()={grabbed}, holding={holding})", False
 
-    if not await move(rig, down_at(x, y, SAFE_HEIGHT_MM), "lift", world, straight=True):
+    if not await move(rig, down_at(x, y, SAFE_HEIGHT_MM, th), "lift", world, straight=True):
         return "lift after grab failed (still holding object)", True
-    if not await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM),
+    if not await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM, th),
                       "transit above drop", world):
         return "transit to drop failed (still holding object)", True
-    if not await move(rig, DROP_POSE, "drop", world, straight=True):
+    if not await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, DROP_POSE.z, th), "drop",
+                      world, straight=True):
         return "descent to drop pose failed (still holding object)", True
 
     await rig.gripper.open()
     still_holding = (await rig.gripper.is_holding_something()).is_holding_something
-    await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM),
+    await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM, th),
                "retreat from drop", world, straight=True)
     if still_holding:
         return "release did not let go (still reports holding)", True
@@ -268,9 +300,10 @@ async def run(dry_run: bool, out_path: str) -> None:
         with open("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type], "wb") as f:
             f.write(frame.color)
 
-        result = ts.validate(ts.classify(frame.color, frame.media_type))
-        for obj in result["objects"]:
-            obj["position"] = ts.localize(frame, obj["bbox_norm"])
+        result, marked = ts.scan(frame)
+        if marked:
+            with open("frame_marked.jpg", "wb") as f:
+                f.write(marked)
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
 
@@ -284,8 +317,12 @@ async def run(dry_run: bool, out_path: str) -> None:
             if reason:
                 print(f"  [SKIP ] {obj['name']}: {reason}")
             else:
-                g = ", ".join(f"{v:.1f}" for v in grasp_point(obj["position"]))
-                print(f"  [PICK ] {obj['name']}  grasp at ({g}) mm")
+                pos = obj["position"]
+                g = ", ".join(f"{v:.1f}" for v in grasp_point(pos))
+                print(f"  [PICK ] {obj['name']}  grasp at ({g}) mm  "
+                      f"theta {grasp_theta(pos):.0f}  closing on {pos['width_mm']:.0f} mm "
+                      f"(long side {pos['length_mm']:.0f} mm at {pos['long_axis_deg']:.0f} deg)  "
+                      f"[{pos['source']}]")
 
         # Only objects with a trustworthy box become obstacles; a bad reading
         # could just as easily wall off the whole table.

@@ -1,0 +1,8 @@
+.env
+frame.jpg
+frame.png
+table_objects.json
+__pycache__/
+.venv/
+.vscode/
+run.py

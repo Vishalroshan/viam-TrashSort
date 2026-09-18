@@ -167,63 +167,108 @@ async def _cam_to_world(machine, camera_name: str) -> np.ndarray:
     return m
 
 
-async def grab_frame() -> Frame:
-    """Pull one capture off the configured Viam camera.
+async def connect():
+    """Open one RobotClient connection to the configured Viam machine.
 
-    The camera hands back several images (colour alongside depth), so select by
-    mime type rather than assuming an order.
+    Callers that only need a single frame can use grab_frame(), which opens
+    and closes its own connection. Callers that go on to drive the arm and
+    gripper after the scan (table_cleanup.py) should call this once and pass
+    the same `machine` to capture() and to every subsequent client, rather
+    than reconnecting per step.
     """
     from viam.robot.client import RobotClient
-    from viam.components.camera import Camera
 
     opts = RobotClient.Options.with_api_key(
         api_key=os.environ["VIAM_API_KEY"],
         api_key_id=os.environ["VIAM_API_KEY_ID"],
     )
     address = os.environ.get("VIAM_ADDRESS", "armfarm15-main.310sld03v2.viam.cloud")
-    camera_name = os.environ.get("VIAM_CAMERA", "cam")
+    return await RobotClient.at_address(address, opts)
 
-    machine = await RobotClient.at_address(address, opts)
-    try:
-        cam = Camera.from_robot(machine, camera_name)
-        images, _ = await cam.get_images()
 
-        color = next(
-            (i for i in images if str(i.mime_type) in SUPPORTED_IMAGE_TYPES), None
-        )
-        if color is None:
-            got = ", ".join(f"{i.name}={i.mime_type}" for i in images) or "nothing"
-            raise RuntimeError(
-                f"camera {camera_name!r} returned no JPEG or PNG image (got: {got})"
-            )
+async def resolve(machine, cls, name: str, retries: int = 3, delay: float = 0.5):
+    """`cls.from_robot(machine, name)`, retrying through a known SDK race.
 
-        depth_img = next((i for i in images if str(i.mime_type) == DEPTH_MIME), None)
-        depth = parse_depth(depth_img.data) if depth_img else None
-        if depth is None:
+    RobotClient.refresh() (run once automatically on connect) silently drops
+    a resource from the local registry if its client registration hiccups
+    during that one pass — the server-side resource_names list still shows
+    it, but from_robot() raises ResourceNotFoundError anyway. Observed
+    intermittently against this exact machine: same resource, same code,
+    alternating pass/fail. A fresh refresh() and retry clears it.
+    """
+    from viam.errors import ResourceNotFoundError
+
+    for attempt in range(retries):
+        try:
+            return cls.from_robot(machine, name)
+        except ResourceNotFoundError:
+            if attempt == retries - 1:
+                raise
             print(
-                f"camera {camera_name!r} returned no depth frame; "
-                "objects will have no 3D position.",
+                f"{name!r} not yet in local registry (attempt {attempt + 1}/{retries}), "
+                "refreshing...",
                 file=sys.stderr,
             )
-            return Frame(color.data, str(color.mime_type), None, None, None)
+            await machine.refresh()
+            await asyncio.sleep(delay)
 
-        props = await cam.get_properties()
-        k = props.intrinsic_parameters
-        intrinsics = (k.focal_x_px, k.focal_y_px, k.center_x_px, k.center_y_px)
 
-        if (depth.shape[1], depth.shape[0]) != (color.width, color.height):
-            raise RuntimeError(
-                f"depth {depth.shape[1]}x{depth.shape[0]} does not match colour "
-                f"{color.width}x{color.height}; the 2D boxes would not line up"
-            )
+async def capture(machine, camera_name: Optional[str] = None) -> Frame:
+    """Pull one capture off the camera on an already-open connection.
 
-        return Frame(
-            color.data,
-            str(color.mime_type),
-            depth,
-            intrinsics,
-            await _cam_to_world(machine, camera_name),
+    The camera hands back several images (colour alongside depth), so select
+    by mime type rather than assuming an order.
+    """
+    from viam.components.camera import Camera
+
+    camera_name = camera_name or os.environ.get("VIAM_CAMERA", "cam")
+    cam = await resolve(machine, Camera, camera_name)
+    images, _ = await cam.get_images()
+
+    color = next(
+        (i for i in images if str(i.mime_type) in SUPPORTED_IMAGE_TYPES), None
+    )
+    if color is None:
+        got = ", ".join(f"{i.name}={i.mime_type}" for i in images) or "nothing"
+        raise RuntimeError(
+            f"camera {camera_name!r} returned no JPEG or PNG image (got: {got})"
         )
+
+    depth_img = next((i for i in images if str(i.mime_type) == DEPTH_MIME), None)
+    depth = parse_depth(depth_img.data) if depth_img else None
+    if depth is None:
+        print(
+            f"camera {camera_name!r} returned no depth frame; "
+            "objects will have no 3D position.",
+            file=sys.stderr,
+        )
+        return Frame(color.data, str(color.mime_type), None, None, None)
+
+    props = await cam.get_properties()
+    k = props.intrinsic_parameters
+    intrinsics = (k.focal_x_px, k.focal_y_px, k.center_x_px, k.center_y_px)
+
+    if (depth.shape[1], depth.shape[0]) != (color.width, color.height):
+        raise RuntimeError(
+            f"depth {depth.shape[1]}x{depth.shape[0]} does not match colour "
+            f"{color.width}x{color.height}; the 2D boxes would not line up"
+        )
+
+    return Frame(
+        color.data,
+        str(color.mime_type),
+        depth,
+        intrinsics,
+        await _cam_to_world(machine, camera_name),
+    )
+
+
+async def grab_frame() -> Frame:
+    """Connect, pull one capture, and disconnect. See capture() for callers
+    that need to keep the connection open past the scan."""
+    machine = await connect()
+    try:
+        return await capture(machine)
     finally:
         await machine.close()
 

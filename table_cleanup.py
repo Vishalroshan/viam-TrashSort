@@ -4,13 +4,18 @@ classified as trash into a fixed drop location.
 
 Reuses table_scan's connect/capture/classify/validate/localize to identify
 what's on the table and where each object sits in world-frame mm. For each
-object marked trash, if its 3D position is trustworthy, the arm:
-  1. moves to a safe transit height,
-  2. approaches from APPROACH_CLEARANCE_MM above the object's centroid,
+object marked trash, if its 3D position is trustworthy, the gripper:
+  1. moves to a safe transit height above the object,
+  2. descends in a straight line to the grasp point,
   3. grabs, and confirms it actually holds something,
-  4. lifts back to transit height, moves over the drop pose, descends,
-     releases, and confirms the release actually let go,
-  5. retreats back up to transit height.
+  4. lifts straight back up, moves over the drop pose, descends, releases,
+     and confirms the release actually let go,
+  5. retreats straight back up to transit height.
+
+Every move targets the `gripper` frame (not the arm flange), and every plan
+is given the other localized objects as obstacles, so the planner routes
+around things that are staying on the table. The table, walls and ceiling
+are already obstacles in the machine's own frame system config.
 
 Objects whose depth signal is too sparse to trust (a common failure mode for
 clear plastic and shiny metal under IR depth sensing — the water bottle on
@@ -18,7 +23,7 @@ this table is the running example) are skipped and reported rather than
 risking a blind grasp.
 
 There is no confirmation prompt: this script scans and immediately acts on
-whatever it classifies as trash.
+whatever it classifies as trash. Ctrl-C stops the arm where it is.
 
 Setup: same as table_scan.py — .env populated, .venv/bin/pip install
        viam-sdk anthropic python-dotenv numpy
@@ -32,27 +37,60 @@ import argparse
 import asyncio
 import json
 import sys
+from dataclasses import dataclass
 
+from grpclib.exceptions import GRPCError
 from viam.components.arm import Arm
 from viam.components.gripper import Gripper
-from viam.proto.common import Pose, PoseInFrame
-from viam.services.motion import MotionClient
+from viam.proto.common import (
+    GeometriesInFrame,
+    Geometry,
+    Pose,
+    PoseInFrame,
+    RectangularPrism,
+    Vector3,
+    WorldState,
+)
+from viam.proto.service.motion import Constraints, LinearConstraint
+from viam.services.motion import Motion
 
 import table_scan as ts
 
-# --- Motion constants, generalized from viam_move_to_centroid.py ----------
+# --- Frame-system facts, read off this machine's config --------------------
 
-SAFE_HEIGHT_MM = 300.0            # world z for every transit move
-APPROACH_CLEARANCE_MM = 150.0     # grab from this far above the centroid z
+# The `gripper` frame sits 150mm out along the arm's tool axis, and its
+# "claws" geometry reaches 50mm beyond that origin. Pointing straight down, a
+# gripper target at height z puts the fingertips at z - CLAW_REACH_MM.
+CLAW_REACH_MM = 50.0
 
-# Top-down orientation used for every synthetic pick/drop pose in the
-# reference script — the end effector points straight down (o_z=-1),
-# no roll (theta=0).
+# The `table` obstacle is a 200mm-tall box whose frame sits at z=-123, so its
+# top surface — where every object rests — is at z=-23.
+TABLE_TOP_Z_MM = -23.0
+
+# --- Motion constants -------------------------------------------------------
+# All heights below are for the gripper frame, not the arm flange.
+
+SAFE_HEIGHT_MM = 200.0            # transit height; fingertips at 150mm
+GRASP_TABLE_CLEARANCE_MM = 10.0   # never plan fingertips closer than this to the table
+OBSTACLE_PADDING_MM = 10.0        # grow each object's box by this on every side
+MOVE_TIMEOUT_S = 60.0
+
+# Top-down orientation used for every synthetic pick/drop pose — the end
+# effector points straight down (o_z=-1), no roll (theta=0).
 DOWN = dict(o_x=0.0, o_y=0.0, o_z=-1.0, theta=0.0)
 
-DROP_POSE = Pose(x=292.5, y=-399.9, z=206.2, **DOWN)
+# Vertical approaches and retreats run close to neighbouring objects, so they
+# go in a straight line rather than wherever the planner's path wanders.
+STRAIGHT = Constraints(
+    linear_constraint=[
+        LinearConstraint(line_tolerance_mm=5.0, orientation_tolerance_degs=5.0)
+    ]
+)
 
-# Verbatim from viam_move_to_centroid.py — a pose the user measured by
+# The previous arm-flange drop pose (z=206.2) less the 150mm gripper offset.
+DROP_POSE = Pose(x=292.5, y=-399.9, z=56.2, **DOWN)
+
+# Verbatim from viam_move_to_centroid.py — an *arm* pose the user measured by
 # jogging the real arm there, not one this script can re-derive.
 HOME_POSE = Pose(
     x=263.16, y=-39.11, z=442.47,
@@ -85,7 +123,7 @@ SIZE_BOUNDS_MM = (5.0, 400.0)
 
 
 def gate(position: dict | None) -> str | None:
-    """Return None if position is trustworthy enough to grasp on, else why not."""
+    """Return None if position is trustworthy enough to act on, else why not."""
     if position is None or "centroid" not in position:
         reason = position["reason"] if position else "no depth frame"
         return f"no usable 3D position ({reason})"
@@ -96,57 +134,137 @@ def gate(position: dict | None) -> str | None:
     lo, hi = SIZE_BOUNDS_MM
     if not all(lo <= s <= hi for s in position["size"]):
         return f"implausible size {position['size']} mm"
+    if position["max"][2] <= TABLE_TOP_Z_MM:
+        return f"reads as below the table surface (top z={position['max'][2]} mm)"
     return None
 
 
-async def move(motion: MotionClient, x: float, y: float, z: float, label: str) -> bool:
-    ok = await motion.move(
-        component_name=ARM_NAME,
-        destination=PoseInFrame(
-            reference_frame="world", pose=Pose(x=x, y=y, z=z, **DOWN)
-        ),
+def resting_box(position: dict) -> tuple[list, list]:
+    """The object's world-frame box, extended down to the table.
+
+    Looking down, depth only sees an object's top surface — a standing can
+    read as 13mm thick at z=101..114. Everything seen is resting on the
+    table, so the part the camera can't see runs down to the tabletop.
+    """
+    lo, hi = list(position["min"]), list(position["max"])
+    lo[2] = min(lo[2], TABLE_TOP_Z_MM)
+    return lo, hi
+
+
+def grasp_point(position: dict) -> tuple[float, float, float]:
+    """Gripper-frame target: the middle of the resting box, kept clear of the table."""
+    lo, hi = resting_box(position)
+    x, y, _ = position["centroid"]
+    z = max((lo[2] + hi[2]) / 2.0,
+            TABLE_TOP_Z_MM + CLAW_REACH_MM + GRASP_TABLE_CLEARANCE_MM)
+    return x, y, z
+
+
+def world_state(objs: list[dict]) -> WorldState:
+    """Every object still on the table, as padded boxes the planner must avoid."""
+    p = OBSTACLE_PADDING_MM
+    geoms = []
+    for o in objs:
+        lo, hi = resting_box(o["position"])
+        c = [(a + b) / 2.0 for a, b in zip(lo, hi)]
+        d = [b - a + 2 * p for a, b in zip(lo, hi)]
+        geoms.append(Geometry(
+            # o_z=1 is the identity orientation; an all-zero one is invalid.
+            center=Pose(x=c[0], y=c[1], z=c[2], o_z=1.0),
+            box=RectangularPrism(dims_mm=Vector3(x=d[0], y=d[1], z=d[2])),
+            label=o["id"],
+        ))
+    return WorldState(
+        obstacles=[GeometriesInFrame(reference_frame="world", geometries=geoms)]
     )
+
+
+def down_at(x: float, y: float, z: float) -> Pose:
+    return Pose(x=x, y=y, z=z, **DOWN)
+
+
+@dataclass
+class Rig:
+    motion: Motion
+    arm: Arm
+    gripper: Gripper
+
+
+async def move(rig: Rig, pose: Pose, label: str, world: WorldState, *,
+               component: str = GRIPPER_NAME, straight: bool = False) -> bool:
+    try:
+        ok = await rig.motion.move(
+            component_name=component,
+            destination=PoseInFrame(reference_frame="world", pose=pose),
+            world_state=world,
+            constraints=STRAIGHT if straight else None,
+            timeout=MOVE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # The deadline only ends the RPC; stop the arm in case execution didn't.
+        await rig.arm.stop()
+        print(f"    move to {label} timed out after {MOVE_TIMEOUT_S:.0f}s",
+              file=sys.stderr)
+        return False
+    except GRPCError as e:
+        # A plan the solver can't satisfy at all (e.g. every IK solution
+        # collides with an obstacle) raises rather than returning False.
+        print(f"    move to {label} failed: {e.message}", file=sys.stderr)
+        return False
     if not ok:
         print(f"    move to {label} failed (planner returned false)", file=sys.stderr)
     return ok
 
 
-async def pick_and_drop(motion: MotionClient, gripper: Gripper, obj: dict) -> str:
-    """Attempt the full pick/drop sequence for one object. Returns an outcome string."""
-    x, y, z = obj["position"]["centroid"]
-    name = obj["name"]
+async def pick_and_drop(rig: Rig, obj: dict, world: WorldState) -> tuple[str, bool]:
+    """Attempt the full pick/drop sequence for one object.
 
-    if not await move(motion, x, y, SAFE_HEIGHT_MM, "transit above object"):
-        return "move to transit-above-object failed"
-    if not await move(motion, x, y, z + APPROACH_CLEARANCE_MM, "approach"):
-        return "move to approach height failed"
+    Returns (outcome, holding): holding is True when the sequence stopped
+    with the object still in the gripper.
+    """
+    x, y, z = grasp_point(obj["position"])
 
-    grabbed = await gripper.grab()
-    holding = (await gripper.is_holding_something()).is_holding_something
+    if not await move(rig, down_at(x, y, SAFE_HEIGHT_MM), "transit above object", world):
+        return "move to transit-above-object failed", False
+    if not await move(rig, down_at(x, y, z), "grasp", world, straight=True):
+        return "descent to grasp point failed", False
+
+    grabbed = await rig.gripper.grab()
+    holding = (await rig.gripper.is_holding_something()).is_holding_something
     if not grabbed or not holding:
-        await move(motion, x, y, SAFE_HEIGHT_MM, "retreat after failed grab")
-        return f"grab failed (grab()={grabbed}, holding={holding})"
+        # Reopen so the next object isn't approached with closed jaws.
+        await rig.gripper.open()
+        await move(rig, down_at(x, y, SAFE_HEIGHT_MM), "retreat after failed grab",
+                   world, straight=True)
+        return f"grab failed (grab()={grabbed}, holding={holding})", False
 
-    if not await move(motion, x, y, SAFE_HEIGHT_MM, "lift"):
-        return "lift after grab failed"
-    if not await move(motion, DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM, "transit above drop"):
-        return "transit to drop failed (still holding object)"
-    if not await move(motion, DROP_POSE.x, DROP_POSE.y, DROP_POSE.z, "drop"):
-        return "descent to drop pose failed (still holding object)"
+    if not await move(rig, down_at(x, y, SAFE_HEIGHT_MM), "lift", world, straight=True):
+        return "lift after grab failed (still holding object)", True
+    if not await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM),
+                      "transit above drop", world):
+        return "transit to drop failed (still holding object)", True
+    if not await move(rig, DROP_POSE, "drop", world, straight=True):
+        return "descent to drop pose failed (still holding object)", True
 
-    await gripper.open()
-    still_holding = (await gripper.is_holding_something()).is_holding_something
-    await move(motion, DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM, "retreat from drop")
+    await rig.gripper.open()
+    still_holding = (await rig.gripper.is_holding_something()).is_holding_something
+    await move(rig, down_at(DROP_POSE.x, DROP_POSE.y, SAFE_HEIGHT_MM),
+               "retreat from drop", world, straight=True)
     if still_holding:
-        return "release did not let go (still reports holding)"
+        return "release did not let go (still reports holding)", True
 
-    return "dropped"
+    return "dropped", False
 
 
 async def run(dry_run: bool, out_path: str) -> None:
     machine = await ts.connect()
     try:
+        arm = await ts.resolve(machine, Arm, ARM_NAME)
         frame = await ts.capture(machine)
+        # World-frame targets should not depend on where the arm was at capture;
+        # logging it makes a drift between runs diagnosable.
+        p = await arm.get_end_position()
+        print(f"arm at capture: ({p.x:.1f}, {p.y:.1f}, {p.z:.1f})")
         with open("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type], "wb") as f:
             f.write(frame.color)
 
@@ -166,32 +284,63 @@ async def run(dry_run: bool, out_path: str) -> None:
             if reason:
                 print(f"  [SKIP ] {obj['name']}: {reason}")
             else:
-                c = obj["position"]["centroid"]
-                print(f"  [PICK ] {obj['name']}  centroid {c} mm")
+                g = ", ".join(f"{v:.1f}" for v in grasp_point(obj["position"]))
+                print(f"  [PICK ] {obj['name']}  grasp at ({g}) mm")
+
+        # Only objects with a trustworthy box become obstacles; a bad reading
+        # could just as easily wall off the whole table.
+        on_table = [o for o in result["objects"] if gate(o["position"]) is None]
+        for o in result["objects"]:
+            if not o["is_trash"] and o not in on_table:
+                print(f"  [WARN ] {o['name']} (keep) has no trustworthy position; "
+                      "the planner cannot avoid it")
 
         attempt = [obj for obj, reason in plan if reason is None]
         if not attempt:
             print("Nothing to pick up.")
             return
         if dry_run:
-            print(f"--dry-run: would attempt {len(attempt)} pick(s); no arm motion.")
+            print(f"--dry-run: would attempt {len(attempt)} pick(s) around "
+                  f"{len(on_table)} modelled object(s); no arm motion.")
             return
 
-        arm = await ts.resolve(machine, Arm, ARM_NAME)
-        gripper = await ts.resolve(machine, Gripper, GRIPPER_NAME)
-        motion = await ts.resolve(machine, MotionClient, MOTION_NAME)
+        rig = Rig(
+            motion=await ts.resolve(machine, Motion, MOTION_NAME),
+            arm=arm,
+            gripper=await ts.resolve(machine, Gripper, GRIPPER_NAME),
+        )
+
+        # Opening a gripper that holds something would drop it wherever the
+        # arm happens to be.
+        if (await rig.gripper.is_holding_something()).is_holding_something:
+            raise SystemExit("gripper already reports holding something; "
+                             "clear it before running")
+        await rig.gripper.open()
 
         try:
             for obj in attempt:
                 print(f"  -> {obj['name']}")
-                outcome = await pick_and_drop(motion, gripper, obj)
+                outcome, holding = await pick_and_drop(
+                    rig, obj, world_state([o for o in on_table if o is not obj]))
                 print(f"     {outcome}")
-        finally:
-            print("Returning home.")
+                if outcome == "dropped" or holding:
+                    on_table.remove(obj)
+                if holding:
+                    print("  Stopping: the gripper is still holding an object; "
+                          "remaining picks skipped.", file=sys.stderr)
+                    break
+        except BaseException:
+            # Ctrl-C or an unexpected error mid-motion: halt the arm where it
+            # is rather than planning a move nobody asked for.
+            print("Interrupted — stopping arm.", file=sys.stderr)
             try:
-                await arm.move_to_position(HOME_POSE)
+                await arm.stop()
             except Exception as e:  # best-effort — log, don't mask the real error
-                print(f"  home move failed: {e}", file=sys.stderr)
+                print(f"  arm stop failed: {e}", file=sys.stderr)
+            raise
+
+        print("Returning home.")
+        await move(rig, HOME_POSE, "home", world_state(on_table), component=ARM_NAME)
     finally:
         await machine.close()
 

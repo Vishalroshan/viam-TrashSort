@@ -88,11 +88,14 @@ Rules for identifying objects:
 Rules for the trash judgment — this is about STATE and USE, not object class:
 - Trash: consumed, spent, damaged, or discarded items with no remaining
   function. Food waste, wrappers, used napkins, empty containers, crumpled
-  paper, broken pieces, disposable cutlery that has been used.
+  paper, broken pieces, disposable cutlery that has been used. Empty containers only
+  when visibly empty (open top, crushed, no lid). A sealed or closed
+  can - is NOT trash regardless of apparent fullness. It may still contain contents.
 - Not trash: tools, electronics, cables, personal belongings, unopened or
   partially full containers, reusable dishes, anything with obvious remaining
   value or function.
-- Ambiguous cases default to is_trash: false. A false negative leaves a mess;
+- Ambiguous cases default to is_trash: false. YOu cannot determine whether a closed
+  can is trash or not. always err on the side of caution. A false negative leaves a mess;
   a false positive throws away someone's keys. Prefer leaving the mess.
 - The `reason` field must state what you actually saw that drove the call,
   not a restatement of the label.
@@ -154,7 +157,8 @@ class Frame:
 
     color: bytes
     media_type: str
-    depth_mm: Optional[np.ndarray]  # (h, w) float32, 0 where the sensor saw nothing
+    # (h, w) float32, 0 where the sensor saw nothing
+    depth_mm: Optional[np.ndarray]
     intrinsics: Optional[tuple]  # (fx, fy, cx, cy)
     cam_to_world: Optional[np.ndarray]  # 4x4, millimetres
     # Objects from the plane-removing segmenter, each (n, 3) camera-frame mm.
@@ -191,7 +195,8 @@ def parse_pcd(data: bytes) -> np.ndarray:
                           zip(fields, header["TYPE"], header["SIZE"])])
         rec = np.frombuffer(data, dtype=dtype, count=int(header["POINTS"][0]),
                             offset=pos)
-        xyz = np.column_stack([rec["x"], rec["y"], rec["z"]]).astype(np.float64)
+        xyz = np.column_stack(
+            [rec["x"], rec["y"], rec["z"]]).astype(np.float64)
     elif header["DATA"][0] == "ascii":
         rows = np.loadtxt(data[pos:].decode().splitlines(), ndmin=2)
         xyz = rows[:, [fields.index(k) for k in "xyz"]]
@@ -244,7 +249,8 @@ async def connect():
         api_key=os.environ["VIAM_API_KEY"],
         api_key_id=os.environ["VIAM_API_KEY_ID"],
     )
-    address = os.environ.get("VIAM_ADDRESS", "armfarm15-main.310sld03v2.viam.cloud")
+    address = os.environ.get(
+        "VIAM_ADDRESS", "armfarm15-main.310sld03v2.viam.cloud")
     return await RobotClient.at_address(address, opts)
 
 
@@ -319,7 +325,8 @@ async def capture(machine, camera_name: Optional[str] = None) -> Frame:
             f"camera {camera_name!r} returned no JPEG or PNG image (got: {got})"
         )
 
-    depth_img = next((i for i in images if str(i.mime_type) == DEPTH_MIME), None)
+    depth_img = next((i for i in images if str(
+        i.mime_type) == DEPTH_MIME), None)
     depth = parse_depth(depth_img.data) if depth_img else None
     if depth is None:
         print(
@@ -596,9 +603,9 @@ def _world_box(frame: Frame, pts_cam: np.ndarray, coverage: float, source: str) 
     major, minor = axes[:, 1], axes[:, 0]
     yaw = math.degrees(math.atan2(major[1], major[0]))
     yaw = (yaw + 90.0) % 180.0 - 90.0  # an axis, not a direction: [-90, 90)
-    extent = lambda d: float(np.subtract(*np.percentile(xy @ d, [99, 1])))  # noqa: E731
+    def extent(d): return float(np.subtract(*np.percentile(xy @ d, [99, 1])))  # noqa: E731
 
-    r3 = lambda v: [round(float(c), 1) for c in v]  # noqa: E731
+    def r3(v): return [round(float(c), 1) for c in v]  # noqa: E731
     return {
         "frame": "world",
         "units": "mm",
@@ -607,7 +614,8 @@ def _world_box(frame: Frame, pts_cam: np.ndarray, coverage: float, source: str) 
         "min": r3(lo),
         "max": r3(hi),
         "size": r3(hi - lo),
-        "long_axis_deg": round(yaw, 1),  # world yaw of the footprint's long side
+        # world yaw of the footprint's long side
+        "long_axis_deg": round(yaw, 1),
         "length_mm": round(extent(major), 1),
         "width_mm": round(extent(minor), 1),
         "points": len(pts),
@@ -732,13 +740,15 @@ def main() -> None:
         json.dump(result, f, indent=2)
 
     trash = sum(1 for o in result["objects"] if o["is_trash"])
-    located = sum(1 for o in result["objects"] if o["position"] and "centroid" in o["position"])
+    located = sum(1 for o in result["objects"]
+                  if o["position"] and "centroid" in o["position"])
     print(f"{len(result['objects'])} objects, {trash} trash, "
           f"{located} localized -> {args.out}")
     for o in result["objects"]:
         verdict = "TRASH" if o["is_trash"] else "keep "
         tag = f"#{o['mark']}" if o["mark"] else "--"
-        print(f"  [{verdict}] {tag:>3} {o['name']}  ({o['confidence']:.2f})  {o['reason']}")
+        print(
+            f"  [{verdict}] {tag:>3} {o['name']}  ({o['confidence']:.2f})  {o['reason']}")
         pos = o["position"]
         if pos and "centroid" in pos:
             c, s = pos["centroid"], pos["size"]
@@ -746,7 +756,8 @@ def main() -> None:
                   f"({pos['points']} pts, {pos['coverage']:.0%} of box, "
                   f"{pos['source']})")
         elif pos:
-            print(f"          no 3D position: {pos['reason']} ({pos['points']} pts)")
+            print(
+                f"          no 3D position: {pos['reason']} ({pos['points']} pts)")
 
 
 if __name__ == "__main__":

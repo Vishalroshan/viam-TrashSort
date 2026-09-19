@@ -15,7 +15,8 @@ heading it was picked up with.
 To push objects apart (e.g. when a spot is too crowded to place into): drag a
 path across the live feed, starting on clear table. The closed gripper
 follows it slowly, SWEEP_CLEARANCE_MM above the table surface fitted from the
-depth camera, with its flat finger face leading, then lifts straight up.
+depth camera (never below the configured tabletop), with its flat finger face
+leading, then lifts straight up.
 
 3D Scan: orbits the arm around the scene's centroid, fuses depth frames into
 a Poisson mesh, and displays the result in the 3D view tab with all pickable
@@ -144,11 +145,30 @@ ARM_NORMAL_ACCEL_DEGS_PER_SEC2 = 381.67
 SWEEP_MAX_WAYPOINTS = 15
 SWEEP_SIMPLIFY_MM = 5.0
 SWEEP_MIN_LENGTH_MM = 20.0
+# Longest single straight move while sweeping. A line-constrained move is
+# only ever tried "direct" (joints interpolated to the goal), and that bows
+# away from the true line more the longer the move and the further out the
+# arm reaches; past SWEEP_LINE's 2mm the planner refuses it outright. Seen
+# on this arm: 105-161mm segments failed, 30-48mm ones passed, one 43mm one
+# failed far out at ~570mm reach.
+SWEEP_STEP_MM = 20.0
 SWEEP_START_CLEARANCE_MM = 25.0
 DRAG_THRESHOLD_PX = 10
 
 SWEEP_LINE = Constraints(linear_constraint=[
     LinearConstraint(line_tolerance_mm=2.0, orientation_tolerance_degs=3.0)])
+
+# Fallbacks for one short sweep step whose straight-line move is refused.
+# A line-constrained move is only ever tried "direct" (joints interpolated
+# to the goal), so where the arm has to swing a joint to keep the gripper
+# pointing down — near a joint limit or an awkward configuration — even a
+# 19mm step gets refused. First relax the line; as a last resort let the
+# planner search freely, which on a step this short still stays close to
+# the line and still avoids the table from the machine config.
+SWEEP_LINE_LOOSE = Constraints(linear_constraint=[
+    LinearConstraint(line_tolerance_mm=6.0, orientation_tolerance_degs=8.0)])
+SWEEP_STEP_FALLBACKS = [(SWEEP_LINE_LOOSE, "looser line (6 mm)"),
+                        (None, "free plan")]
 
 # Reconstruction defaults (overridable via the UI in a future iteration).
 RECONSTRUCT_N_POSES = 12
@@ -156,7 +176,7 @@ RECONSTRUCT_RADIUS_MM = 280.0
 RECONSTRUCT_HEIGHT_MM = 250.0
 
 
-async def sweep_move(rig, pose, label: str, world) -> bool:
+async def sweep_move(rig, pose, label: str, world, constraints=SWEEP_LINE) -> bool:
     from grpclib.exceptions import GRPCError
     from viam.proto.common import PoseInFrame
 
@@ -164,7 +184,7 @@ async def sweep_move(rig, pose, label: str, world) -> bool:
         ok = await rig.motion.move(
             component_name=tc.GRIPPER_NAME,
             destination=PoseInFrame(reference_frame="world", pose=pose),
-            world_state=world, constraints=SWEEP_LINE,
+            world_state=world, constraints=constraints,
             timeout=tc.MOVE_TIMEOUT_S * 3,
         )
     except asyncio.TimeoutError:
@@ -230,6 +250,18 @@ def sweep_theta(start, end) -> float:
     theta = 90.0 - yaw + tc.JAW_AXIS_OFFSET_DEG
     lo = tc.HOME_POSE.theta - 90.0
     return lo + (theta - lo) % 180.0
+
+
+def sweep_thetas(start, end) -> list[float]:
+    """Gripper rolls that sweep this path, preferred first.
+
+    The closed gripper leads with a flat finger face either way round, so
+    theta and theta + 180 push the same. They put the wrist camera on opposite
+    sides, though, and near a wall or at some wrist angles only one of them
+    is collision-free.
+    """
+    th = sweep_theta(start, end)
+    return [th, th + 180.0 if th < tc.HOME_POSE.theta else th - 180.0]
 
 
 def _box_gap(point, obj: dict) -> float:
@@ -310,6 +342,8 @@ class Robot:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.machine = None
         self.arm = None
+        # Arm pose when the latest scan was taken; every action returns here.
+        self.scan_pose = None
         self._connect_lock = asyncio.Lock()
 
     def submit(self, coro):
@@ -349,6 +383,7 @@ class Robot:
         machine = await self._connected()
         try:
             frame = await ts.capture(machine)
+            self.scan_pose = await self.arm.get_end_position()
         except Exception:
             self.machine = None
             raise
@@ -391,7 +426,11 @@ class Robot:
         k = (await cam.get_properties()).intrinsic_parameters
         intr = (k.focal_x_px * w / k.width_px, k.focal_y_px * h / k.height_px,
                 k.center_x_px * w / k.width_px, k.center_y_px * h / k.height_px)
-        return depth, intr, await ts._cam_to_world(machine, name)
+        # Same per-frame levelling as ts.capture(), so clicked points and sweep
+        # paths agree with the scan on where the table is.
+        c2w, note = ts.level_to_table(depth, intr, await ts._cam_to_world(machine, name))
+        print(note)
+        return depth, intr, c2w
 
     async def trace_path(self, pixels: list, img_w: int, img_h: int) -> list:
         depth, (fx, fy, cx, cy), c2w = await self._depth_view()
@@ -409,7 +448,9 @@ class Robot:
             p = ray_to_plane(origin, rot @ np.array([(du - cx) / fx, (dv - cy) / fy, 1.0]),
                              coef)
             if p is not None:
-                pts.append(tuple(float(c) for c in p))
+                # Never below the configured tabletop, which was checked by
+                # hand; the camera's view of it only ever raises the path.
+                pts.append((float(p[0]), float(p[1]), max(float(p[2]), tc.TABLE_TOP_Z_MM)))
         path = simplify_path(pts, SWEEP_SIMPLIFY_MM)
         tol = SWEEP_SIMPLIFY_MM
         while len(path) > SWEEP_MAX_WAYPOINTS:
@@ -431,18 +472,19 @@ class Robot:
             raise RuntimeError("gripper already reports holding something; "
                                "clear it before running")
         await rig.gripper.open()
-        # Where the arm is now is where this action returns it to at the end.
-        self.start_pose = await rig.arm.get_end_position()
+        # Where this action returns the arm to at the end: the pose of the
+        # latest scan, or (with no scan yet) wherever the arm is now.
+        self.return_pose = self.scan_pose or await rig.arm.get_end_position()
         return rig
 
     async def _go_back(self, rig: tc.Rig, world: WorldState) -> list[str]:
-        """Return the arm to where this action started. [] if it got there,
-        else a message for the chat."""
-        s = self.start_pose
-        print(f"Returning to the starting position ({s.x:.0f}, {s.y:.0f}, {s.z:.0f}).")
+        """Return the arm to where the latest scan was taken. [] if it got
+        there, else a message for the chat."""
+        s = self.return_pose
+        print(f"Returning to the scan position ({s.x:.0f}, {s.y:.0f}, {s.z:.0f}).")
         if await tc.return_to_start(rig, s, world):
             return []
-        return ["Could not get back to the starting position: the arm is stopped "
+        return ["Could not get back to the scan position: the arm is stopped "
                 "where it is. Press Clear arm error first if it faulted."]
 
     @staticmethod
@@ -494,9 +536,15 @@ class Robot:
 
         if not await tc.move(rig, tc.down_at(x, y, tc.SAFE_HEIGHT_MM, th),
                              "transit above object", world):
-            return ["move to transit-above-object failed"]
+            return (["move to transit-above-object failed"]
+                    + await self._go_back(rig, world))
         if not await tc.move(rig, tc.down_at(x, y, z, th), "grasp", world, straight=True):
-            return ["descent to grasp point failed"]
+            # It may have stopped part way down beside the object; rise
+            # straight up before heading back.
+            await tc.move(rig, tc.down_at(x, y, tc.SAFE_HEIGHT_MM, th),
+                          "retreat after failed descent", world, straight=True)
+            return (["descent to grasp point failed"]
+                    + await self._go_back(rig, world))
 
         grabbed = await rig.gripper.grab()
         holding = (await rig.gripper.is_holding_something()).is_holding_something
@@ -548,31 +596,62 @@ class Robot:
                 print(f"!! could not restore arm speed: {e}", file=sys.stderr)
 
     async def _sweep(self, rig, path, objects) -> list[str]:
-        th = sweep_theta(path[0], path[-1])
         lift = tc.CLAW_REACH_MM + SWEEP_CLEARANCE_MM
         sx, sy, sz = path[0]
         free = WorldState()
+        world = tc.world_state(located(objects))
 
-        if not await tc.move(rig, tc.down_at(sx, sy, tc.SAFE_HEIGHT_MM, th),
-                             "transit above path start", tc.world_state(located(objects))):
-            return await self._sweep_home(rig, th, "move above the path start failed")
+        th = None
+        for cand in sweep_thetas(path[0], path[-1]):
+            if await tc.move(rig, tc.down_at(sx, sy, tc.SAFE_HEIGHT_MM, cand),
+                             f"transit above path start (theta {cand:.0f})", world):
+                th = cand
+                break
+        if th is None:
+            # Nothing was executed: the gripper is still up where it started,
+            # so there is nothing to lift out of — just go back.
+            return (["move above the path start failed with the gripper either "
+                     "way round (see the terminal for what it would hit). Try "
+                     "starting the path further from the walls."]
+                    + await self._go_back(rig, world))
 
         await rig.arm.do_command({"set_speed": SWEEP_SPEED_DEGS_PER_SEC,
                                   "set_acceleration": SWEEP_ACCEL_DEGS_PER_SEC2})
         print(f"arm speed set to {SWEEP_SPEED_DEGS_PER_SEC:.0f} deg/s for the sweep")
         if not await sweep_move(rig, tc.down_at(sx, sy, sz + lift, th), "descent to path", free):
             return await self._sweep_home(rig, th, "descent to the path start failed")
-        for i, (x, y, z) in enumerate(path[1:], 1):
-            if not await sweep_move(rig, tc.down_at(x, y, z + lift, th),
-                                    f"path waypoint {i}/{len(path) - 1}", free):
-                return await self._sweep_home(
-                    rig, th, f"sweep stopped before waypoint {i}/{len(path) - 1}")
+        for i, (a, b) in enumerate(zip(path, path[1:]), 1):
+            # Split into short straight steps, each well inside the planner's
+            # 2mm line tolerance (see SWEEP_STEP_MM).
+            steps = max(1, math.ceil(math.dist(a[:2], b[:2]) / SWEEP_STEP_MM))
+            for k in range(1, steps + 1):
+                x, y, z = (a[j] + (b[j] - a[j]) * k / steps for j in range(3))
+                pose = tc.down_at(x, y, z + lift, th)
+                label = f"path waypoint {i}/{len(path) - 1} step {k}/{steps}"
+                if await sweep_move(rig, pose, label, free):
+                    continue
+                # Log where the arm is, to see which joint is at its limit.
+                joints = (await rig.arm.get_joint_positions()).values
+                print(f"    joints (deg) at ({x:.0f}, {y:.0f}): "
+                      + ", ".join(f"{j:.0f}" for j in joints), file=sys.stderr)
+                for constraints, how in SWEEP_STEP_FALLBACKS:
+                    print(f"    retrying {label} with {how}", file=sys.stderr)
+                    if await sweep_move(rig, pose, f"{label} ({how})", free,
+                                        constraints):
+                        break
+                else:
+                    return await self._sweep_home(
+                        rig, th, f"sweep stopped on the way to waypoint "
+                        f"{i}/{len(path) - 1}")
         return await self._sweep_home(rig, th, f"swept {path_length(path):.0f} mm")
 
     async def _sweep_home(self, rig, th: float, outcome: str) -> list[str]:
         p = (await rig.motion.get_pose(tc.GRIPPER_NAME, "world")).pose
-        if not await sweep_move(rig, tc.down_at(p.x, p.y, tc.SAFE_HEIGHT_MM, th),
-                                "lift after sweep", WorldState()):
+        # Only lift if the gripper is actually down below transit height; a
+        # "lift" from higher up would be a descent, and fails the line rule.
+        if p.z < tc.SAFE_HEIGHT_MM - 1.0 and not await sweep_move(
+                rig, tc.down_at(p.x, p.y, tc.SAFE_HEIGHT_MM, th),
+                "lift after sweep", WorldState()):
             return [outcome, "lift afterwards failed: the gripper is still down at "
                     "the table. If the arm faulted, press Clear arm error, then "
                     "jog it up before anything else."]
@@ -598,8 +677,8 @@ class Robot:
             radius=RECONSTRUCT_RADIUS_MM,
             height=RECONSTRUCT_HEIGHT_MM,
             on_progress=on_progress,
-            # Come back to where the orbit started, not a fixed home pose.
-            return_pose=await self.arm.get_end_position(),
+            # Come back to where the latest scan was taken.
+            return_pose=self.scan_pose or await self.arm.get_end_position(),
         )
 
     async def clear_error(self) -> list[str]:

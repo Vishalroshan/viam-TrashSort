@@ -73,6 +73,14 @@ TABLE_TOP_Z_MM = ts.TABLE_TOP_Z_MM
 
 SAFE_HEIGHT_MM = 200.0            # transit height; fingertips at 150mm
 GRASP_TABLE_CLEARANCE_MM = 10.0   # never plan fingertips closer than this to the table
+
+# How far an object can reach up between the open fingers before it hits the
+# gripper body. From the machine's gripper geometry, the `case-gripper` box
+# ends at the gripper frame's origin and the claws reach CLAW_REACH_MM past
+# it, so this is the free finger length. Measure it on the real gripper and
+# adjust if it differs.
+FINGER_LENGTH_MM = 50.0
+PALM_CLEARANCE_MM = 5.0           # keep the object's top this far below the body
 OBSTACLE_PADDING_MM = 10.0        # grow each object's box by this on every side
 MOVE_TIMEOUT_S = 60.0
 
@@ -180,11 +188,21 @@ def resting_box(position: dict) -> tuple[list, list]:
 
 
 def grasp_point(position: dict) -> tuple[float, float, float]:
-    """Gripper-frame target: the middle of the resting box, kept clear of the table."""
+    """Gripper-frame target: the middle of the resting box, kept clear of the table.
+
+    Coming straight down, the object slides up between the fingers. If its top
+    would reach past the fingers into the gripper body, grasp higher instead:
+    just high enough that the top stays PALM_CLEARANCE_MM below the body, so
+    the fingers close on the object's upper part.
+    """
     lo, hi = resting_box(position)
     x, y, _ = position["centroid"]
     z = max((lo[2] + hi[2]) / 2.0,
             TABLE_TOP_Z_MM + CLAW_REACH_MM + GRASP_TABLE_CLEARANCE_MM)
+    # Fingertips sit at z - CLAW_REACH_MM and the body FINGER_LENGTH_MM above them.
+    body_z = z - CLAW_REACH_MM + FINGER_LENGTH_MM
+    if hi[2] + PALM_CLEARANCE_MM > body_z:
+        z += hi[2] + PALM_CLEARANCE_MM - body_z
     return x, y, z
 
 

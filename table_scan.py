@@ -363,6 +363,10 @@ async def capture(machine, camera_name: Optional[str] = None) -> Frame:
             f"{color.width}x{color.height}; the 2D boxes would not line up"
         )
 
+    cam_to_world, note = level_to_table(
+        depth, intrinsics, await _cam_to_world(machine, camera_name))
+    print(note, file=sys.stderr if "NOT" in note else sys.stdout)
+
     # The segmenter takes its own point cloud a moment after get_images();
     # both describe the same scene as long as the arm holds still between.
     return Frame(
@@ -370,7 +374,7 @@ async def capture(machine, camera_name: Optional[str] = None) -> Frame:
         str(color.mime_type),
         depth,
         intrinsics,
-        await _cam_to_world(machine, camera_name),
+        cam_to_world,
         await segment(machine, camera_name),
     )
 
@@ -460,7 +464,79 @@ def _otsu(values: np.ndarray, bins: int = 64) -> tuple[float, float, float]:
 
 # The machine's `table` obstacle is a 200mm-tall box whose frame sits at
 # z=-123, so its top surface — where every object rests — is at z=-23.
+# Confirmed by hand: lowering the gripper to 100/50/30/15mm above it by this
+# number measured exactly 100/50/30/15mm with a ruler.
 TABLE_TOP_Z_MM = -23.0
+
+# How far level_to_table() may move the camera before the fit is distrusted.
+# Seen so far: up to ~5 deg of tilt and ~25mm of height.
+LEVEL_MAX_TILT_DEG = 10.0
+LEVEL_MAX_SHIFT_MM = 50.0
+
+
+def level_to_table(depth: np.ndarray, intrinsics: tuple,
+                   cam_to_world: np.ndarray) -> tuple[np.ndarray, str]:
+    """Correct the camera pose so the table it sees lies flat at TABLE_TOP_Z_MM.
+
+    The frame system's camera pose is off by an amount that changes with the
+    arm's pose: with the camera frame fitted at home, the table read flat
+    there but tilted 4.7 deg (+-23mm across the view) from another pose. The
+    table itself is known to be flat at TABLE_TOP_Z_MM, so fit it in this
+    frame's depth and tilt/shift the camera to match. The pivot is the table
+    point under the camera, so x/y there are unchanged; only the height and
+    tilt the table reveals are corrected.
+
+    Returns (corrected cam_to_world, note for the log). When the table can't
+    be fitted, or the correction would be implausibly large, the camera pose
+    is returned unchanged and the note says so.
+    """
+    step = 4  # every 4th pixel is plenty for a plane
+    v, u = np.mgrid[0:depth.shape[0]:step, 0:depth.shape[1]:step]
+    z = depth[::step, ::step]
+    ok = z > 0
+    fx, fy, cx, cy = intrinsics
+    zz = z[ok].astype(np.float64)
+    cam = np.column_stack([(u[ok] - cx) * zz / fx, (v[ok] - cy) * zz / fy, zz])
+    world = cam @ cam_to_world[:3, :3].T + cam_to_world[:3, 3]
+
+    # Start from everything near the configured tabletop (the floor beyond the
+    # edge is a metre down), then refit, dropping what sits on the table.
+    keep = np.abs(world[:, 2] - TABLE_TOP_Z_MM) < LEVEL_MAX_SHIFT_MM + 20
+    if keep.sum() < 1000:
+        return cam_to_world, "camera NOT levelled: too little table in view"
+    ones = np.ones(len(world))
+    for _ in range(5):
+        a = np.column_stack([world[keep, 0], world[keep, 1], ones[keep]])
+        coef, *_ = np.linalg.lstsq(a, world[keep, 2], rcond=None)
+        resid = world[:, 2] - np.column_stack([world[:, 0], world[:, 1], ones]) @ coef
+        spread = max(1.4826 * float(np.median(np.abs(resid[keep]))), 0.5)
+        keep = np.abs(resid) < 3 * spread
+    if keep.sum() < 1000:
+        return cam_to_world, "camera NOT levelled: too little table in view"
+
+    normal = np.array([-coef[0], -coef[1], 1.0])
+    normal /= np.linalg.norm(normal)
+    tilt = math.degrees(math.acos(normal[2]))
+    ox, oy = cam_to_world[0, 3], cam_to_world[1, 3]
+    under = np.array([ox, oy, coef[0] * ox + coef[1] * oy + coef[2]])
+    shift = under[2] - TABLE_TOP_Z_MM
+    if tilt > LEVEL_MAX_TILT_DEG or abs(shift) > LEVEL_MAX_SHIFT_MM:
+        return cam_to_world, (f"camera NOT levelled: the table reads {tilt:.1f} deg tilted "
+                              f"and {shift:+.0f} mm off, too far to trust")
+
+    # Smallest rotation taking the measured table normal to straight up.
+    axis = np.cross(normal, [0.0, 0.0, 1.0])
+    s = np.linalg.norm(axis)
+    rot = np.eye(3)
+    if s > 1e-9:
+        k = axis / s
+        kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        rot = np.eye(3) + s * kx + (1 - normal[2]) * kx @ kx
+    fix = np.eye(4)
+    fix[:3, :3] = rot
+    fix[:3, 3] = np.array([ox, oy, TABLE_TOP_Z_MM]) - rot @ under
+    return fix @ cam_to_world, (f"camera levelled to the table: corrected "
+                                f"{tilt:.1f} deg of tilt and {shift:+.1f} mm of height")
 
 # Fragments whose world-frame footprints come within this distance of each
 # other are one object. The segmenter over-splits: a crushed can came back as
@@ -468,7 +544,14 @@ TABLE_TOP_Z_MM = -23.0
 # joins neighbouring cells of near-equal height. The cost: objects closer
 # than this also merge, and are then reported rather than picked.
 MERGE_GAP_MM = 10.0
-MIN_OBJECT_POINTS = 300
+# What's left after plane removal also includes depth speckle, stains and
+# patches of table sitting a few mm proud of the fitted plane. Measured on
+# this table, real objects had 4,000+ points and stood 50+ mm tall (90th
+# percentile height); the phantoms had 400-2,000 points and stood 5-16 mm
+# tall. A blob must pass both to be drawn as a mark.
+FOOTPRINT_CELL_MM = 5.0
+MIN_OBJECT_POINTS = 1000
+MIN_OBJECT_HEIGHT_MM = 12.0   # 90th-percentile height above the table
 
 
 def _project(frame: Frame, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -482,44 +565,65 @@ def _project(frame: Frame, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def group_objects(frame: Frame) -> list[np.ndarray]:
-    """Merge the segmenter's fragments into one camera-frame point set per object.
+    """Split the segmenter's above-table points into one camera-frame point
+    set per object: the connected blobs of their footprint seen from above,
+    where points within MERGE_GAP_MM of each other are connected.
+
+    The segmenter's own piece boundaries aren't used either way. It
+    over-splits (a crushed can came back as ~14 pieces), and it also joins
+    things of similar height across bare table: one piece held a bottle, the
+    rim of a can 300px away and scattered specks, and merging pieces by
+    bounding-box overlap then fused the bottle and the can into one mark.
 
     Ordered left to right in the image, so mark numbers read naturally.
     """
     rot, shift = frame.cam_to_world[:3, :3], frame.cam_to_world[:3, 3]
-    pieces, footprints = [], []
-    for s in frame.segments:
-        s = s[s[:, 2] > 0]
-        if len(s) == 0:
+    kept = [s[s[:, 2] > 0] for s in frame.segments]
+    if not any(len(s) for s in kept):
+        return []
+    cam = np.vstack(kept)
+    world = cam @ rot.T + shift
+    # Only the biggest plane (the table) is removed, so the floor beyond its
+    # edge comes back too, far below the tabletop.
+    above = world[:, 2] > TABLE_TOP_Z_MM
+    cam, world = cam[above], world[above]
+    if len(cam) == 0:
+        return []
+
+    # Occupied footprint cells, and which cell each point falls in.
+    ij = np.floor(world[:, :2] / FOOTPRINT_CELL_MM).astype(np.int64)
+    cells, point_cell = np.unique(ij, axis=0, return_inverse=True)
+    point_cell = point_cell.ravel()
+    index = {(int(i), int(j)): k for k, (i, j) in enumerate(cells)}
+
+    # Flood-fill: cells within `reach` cells of each other are one blob.
+    reach = int(math.ceil(MERGE_GAP_MM / FOOTPRINT_CELL_MM))
+    offsets = [(di, dj) for di in range(-reach, reach + 1)
+               for dj in range(-reach, reach + 1) if di or dj]
+    label = np.full(len(cells), -1)
+    n_labels = 0
+    for start in range(len(cells)):
+        if label[start] >= 0:
             continue
-        w = s @ rot.T + shift
-        # Only the biggest plane (the table) is removed, so the floor beyond
-        # its edge comes back as dozens of fragments far below the tabletop.
-        if np.median(w[:, 2]) < TABLE_TOP_Z_MM:
-            continue
-        pieces.append(s)
-        footprints.append((w[:, :2].min(axis=0), w[:, :2].max(axis=0)))
+        label[start] = n_labels
+        stack = [start]
+        while stack:
+            i, j = cells[stack.pop()]
+            for di, dj in offsets:
+                k = index.get((int(i) + di, int(j) + dj))
+                if k is not None and label[k] < 0:
+                    label[k] = n_labels
+                    stack.append(k)
+        n_labels += 1
 
-    parent = list(range(len(pieces)))
+    point_label = label[point_cell]
+    objects = [cam[point_label == n] for n in range(n_labels)]
 
-    def root(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
+    def stands_up(o: np.ndarray) -> bool:
+        z = (o @ rot.T + shift)[:, 2]
+        return np.percentile(z, 90) - TABLE_TOP_Z_MM >= MIN_OBJECT_HEIGHT_MM
 
-    for i in range(len(pieces)):
-        for j in range(i + 1, len(pieces)):
-            (lo_a, hi_a), (lo_b, hi_b) = footprints[i], footprints[j]
-            gap = np.maximum(lo_b - hi_a, lo_a - hi_b)
-            if (gap <= MERGE_GAP_MM).all():
-                parent[root(i)] = root(j)
-
-    groups: dict[int, list] = {}
-    for i, s in enumerate(pieces):
-        groups.setdefault(root(i), []).append(s)
-    objects = [np.vstack(g) for g in groups.values()]
-    objects = [o for o in objects if len(o) >= MIN_OBJECT_POINTS]
+    objects = [o for o in objects if len(o) >= MIN_OBJECT_POINTS and stands_up(o)]
     return sorted(objects, key=lambda o: float(np.median(_project(frame, o)[0])))
 
 

@@ -17,14 +17,15 @@ path across the live feed, starting on clear table. The closed gripper
 follows it slowly, SWEEP_CLEARANCE_MM above the table surface fitted from the
 depth camera, with its flat finger face leading, then lifts straight up.
 
+3D Scan: orbits the arm around the scene's centroid, fuses depth frames into
+a Poisson mesh, and displays the result in the 3D view tab with all pickable
+objects' grasp points marked as red spheres + orange approach arrows.
+
 Stop halts the arm immediately, wherever it is. Clear arm error recovers the
 xArm after a collision fault.
 
-Reuses table_scan for capture/scan and table_cleanup for the gate, grasp
-planning and pick/drop motion; neither file is changed.
-
 Setup: as table_cleanup.py, plus
-    .venv/bin/pip install PyQt5
+    .venv/bin/pip install PyQt5 open3d
 
 Run:
     .venv/bin/python cleanup_ui.py
@@ -52,8 +53,10 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -69,6 +72,7 @@ from viam.services.motion import Motion
 
 import table_cleanup as tc
 import table_scan as ts
+import table_reconstruct as tr
 
 INTERPRET_PROMPT = """You are the chat interface of a tabletop robot arm. The arm
 can pick objects up off the table and either drop them in a trash bin or set
@@ -112,13 +116,10 @@ a short message shown to the user: for "pick" or "place", say which objects
 you chose, naming them the way the photo shows them; for "chat", answer or
 ask."""
 
-# Clicked pixels are read as the median depth of this many pixels around
-# them, so one dropout or edge pixel doesn't send the arm somewhere else.
 LOCATE_WINDOW_PX = 4
 
 
 def shifted(obj: dict, dx: float, dy: float) -> dict:
-    """A copy of obj with its world box moved by (dx, dy)."""
     pos = dict(obj["position"])
     for key in ("centroid", "min", "max"):
         pos[key] = [pos[key][0] + dx, pos[key][1] + dy, pos[key][2]]
@@ -126,12 +127,6 @@ def shifted(obj: dict, dx: float, dy: float) -> dict:
 
 
 def blocking_object(obj: dict, point: tuple, objects: list[dict]) -> dict | None:
-    """Another object that obj would land on or against if centred on point.
-
-    Conservative: obj is treated as a disc as wide as its long side, grown by
-    the obstacle padding, since its heading on arrival is only as good as
-    the grasp.
-    """
     r = obj["position"]["length_mm"] / 2 + tc.OBSTACLE_PADDING_MM
     for o in located(objects):
         if o is not obj and _box_gap(point, o) < r:
@@ -139,43 +134,29 @@ def blocking_object(obj: dict, point: tuple, objects: list[dict]) -> dict | None
     return None
 
 
-# --- Sweep: push objects along a path drawn on the live feed ----------------
-
-# Fingertip gap above the table while sweeping. Starts deliberately high: the
-# table comes from the camera's depth, which disagrees with the configured
-# `table` obstacle by ~23mm and tilts ~27mm across the workspace, so real
-# clearance is only as good as the camera calibration. Lower it by hand
-# toward 5mm after watching real runs.
 SWEEP_CLEARANCE_MM = 20.0
 
-# Joint speed/acceleration while sweeping, via the xArm driver's set_speed /
-# set_acceleration DoCommands. The driver can't report its current values, so
-# the normal ones are restored from these constants afterwards.
 SWEEP_SPEED_DEGS_PER_SEC = 8.0
 SWEEP_ACCEL_DEGS_PER_SEC2 = 50.0
-# MUST match speed_degs_per_sec / acceleration_degs_per_sec_per_sec in the
-# arm's config (Viam app -> CONFIGURE -> arm -> JSON). These are the module
-# defaults, correct only if the config leaves them unset.
 ARM_NORMAL_SPEED_DEGS_PER_SEC = 60.0
 ARM_NORMAL_ACCEL_DEGS_PER_SEC2 = 381.67
 
 SWEEP_MAX_WAYPOINTS = 15
 SWEEP_SIMPLIFY_MM = 5.0
 SWEEP_MIN_LENGTH_MM = 20.0
-# Half the closed gripper's footprint: the start point must be at least this
-# far from every object, or the straight-down descent would land on it.
 SWEEP_START_CLEARANCE_MM = 25.0
-# A drag shorter than this (screen pixels) is a click, not a path.
 DRAG_THRESHOLD_PX = 10
 
-# Tighter than table_cleanup.STRAIGHT: at 20mm (eventually 5mm) off the
-# table, the default 5mm line tolerance is most of the clearance.
 SWEEP_LINE = Constraints(linear_constraint=[
     LinearConstraint(line_tolerance_mm=2.0, orientation_tolerance_degs=3.0)])
 
+# Reconstruction defaults (overridable via the UI in a future iteration).
+RECONSTRUCT_N_POSES = 12
+RECONSTRUCT_RADIUS_MM = 280.0
+RECONSTRUCT_HEIGHT_MM = 250.0
+
 
 async def sweep_move(rig, pose, label: str, world) -> bool:
-    """tc.move for sweep strokes: straight, but with the tighter SWEEP_LINE."""
     from grpclib.exceptions import GRPCError
     from viam.proto.common import PoseInFrame
 
@@ -184,7 +165,6 @@ async def sweep_move(rig, pose, label: str, world) -> bool:
             component_name=tc.GRIPPER_NAME,
             destination=PoseInFrame(reference_frame="world", pose=pose),
             world_state=world, constraints=SWEEP_LINE,
-            # Slow joints make every stroke take longer than a normal move.
             timeout=tc.MOVE_TIMEOUT_S * 3,
         )
     except asyncio.TimeoutError:
@@ -200,13 +180,6 @@ async def sweep_move(rig, pose, label: str, world) -> bool:
 
 
 def fit_table_plane(pts: np.ndarray) -> np.ndarray:
-    """(a, b, c) for the table plane z = a*x + b*y + c through world points.
-
-    Seeded from the most common height — the table is the biggest flat
-    thing in view — because a plain least-squares start gets dragged far off
-    by the floor beyond the table edge (~1m lower). Then refit on points near
-    the plane a few times, so objects on the table stop pulling the fit.
-    """
     bins = np.arange(pts[:, 2].min(), pts[:, 2].max() + 5.0, 5.0)
     hist, edges = np.histogram(pts[:, 2], bins=bins)
     mode = edges[hist.argmax()] + 2.5
@@ -220,7 +193,6 @@ def fit_table_plane(pts: np.ndarray) -> np.ndarray:
 
 
 def ray_to_plane(origin: np.ndarray, direction: np.ndarray, coef) -> np.ndarray | None:
-    """Where the ray origin + t*direction (t > 0) meets z = a*x + b*y + c."""
     a, b, c = coef
     n = np.array([-a, -b, 1.0])
     denom = n @ direction
@@ -231,7 +203,6 @@ def ray_to_plane(origin: np.ndarray, direction: np.ndarray, coef) -> np.ndarray 
 
 
 def simplify_path(pts: list, tol: float) -> list:
-    """Ramer-Douglas-Peucker on (x, y, ...) points, by their xy distance."""
     if len(pts) < 3:
         return list(pts)
     p0, p1 = np.array(pts[0][:2]), np.array(pts[-1][:2])
@@ -255,13 +226,6 @@ def path_length(path: list) -> float:
 
 
 def sweep_theta(start, end) -> float:
-    """Gripper roll that makes the jaw axis run along start -> end.
-
-    Travel along the jaw axis puts the flat outer face of the leading finger
-    forward, a broad pushing surface. The jaw axis (gripper y) lies at world
-    yaw 90 - theta + JAW_AXIS_OFFSET_DEG; the jaws are symmetric, so wrap to
-    within 90 degrees of the home roll, as tc.grasp_theta does.
-    """
     yaw = math.degrees(math.atan2(end[1] - start[1], end[0] - start[0]))
     theta = 90.0 - yaw + tc.JAW_AXIS_OFFSET_DEG
     lo = tc.HOME_POSE.theta - 90.0
@@ -269,7 +233,6 @@ def sweep_theta(start, end) -> float:
 
 
 def _box_gap(point, obj: dict) -> float:
-    """xy distance from point to obj's world box (0 inside it)."""
     lo, hi = obj["position"]["min"], obj["position"]["max"]
     dx = max(lo[0] - point[0], 0, point[0] - hi[0])
     dy = max(lo[1] - point[1], 0, point[1] - hi[1])
@@ -281,7 +244,6 @@ def located(objects: list[dict]) -> list[dict]:
 
 
 def path_crosses(path: list, objects: list[dict]) -> list[dict]:
-    """Objects whose box the path passes within the gripper's half-width of."""
     hits = []
     for o in located(objects):
         for p, q in zip(path, path[1:]):
@@ -311,7 +273,6 @@ INTERPRET_SCHEMA = {
 def interpret(message: str, objects: list[dict], marked: bytes | None,
               pending: dict | None, has_point: bool, has_path: bool,
               history: list[dict]) -> dict:
-    """Ask Claude what the user's message means for the current scan."""
     listing = [{
         "id": o["id"], "mark": o["mark"], "name": o["name"],
         "is_trash": o["is_trash"], "reason": o["reason"],
@@ -338,23 +299,17 @@ def interpret(message: str, objects: list[dict], marked: bytes | None,
         max_tokens=2000,
         system=INTERPRET_PROMPT,
         output_config={"format": {"type": "json_schema", "schema": INTERPRET_SCHEMA}},
-        # Earlier turns as plain text, so "the other one" / "yes" resolve;
-        # only the current turn carries the photo and the scan.
         messages=history + [{"role": "user", "content": content}],
     )
     return json.loads(next(b.text for b in resp.content if b.type == "text"))
 
 
 class Robot:
-    """The machine connection and every robot operation, run on a private
-    asyncio loop in a background thread so the window never blocks."""
-
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.machine = None
         self.arm = None
-        # The live feed and a scan can both want the first connection at once.
         self._connect_lock = asyncio.Lock()
 
     def submit(self, coro):
@@ -369,12 +324,6 @@ class Robot:
         return self.machine
 
     async def feed(self, show, is_on):
-        """Stream colour frames to show(bytes) for as long as the loop runs.
-
-        Asks for the colour source only: the depth frame that comes with it
-        by default is 1.8MB and triples the time per frame (~1.8s vs ~0.6s
-        through the cloud connection).
-        """
         cam, source = None, None
         while True:
             if not is_on():
@@ -401,12 +350,10 @@ class Robot:
         try:
             frame = await ts.capture(machine)
         except Exception:
-            # Most likely a dropped connection; reconnect on the next call.
             self.machine = None
             raise
         with open("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type], "wb") as f:
             f.write(frame.color)
-        # Claude's API call blocks; off the loop, so Stop still gets through.
         result, marked = await asyncio.to_thread(ts.scan, frame)
         if marked:
             with open("frame_marked.jpg", "wb") as f:
@@ -416,16 +363,8 @@ class Robot:
         return result, marked or frame.color
 
     async def locate(self, u: float, v: float, img_w: int, img_h: int) -> tuple:
-        """World-frame (x, y, z) mm of the surface under colour pixel (u, v).
-
-        The live feed is colour only, so fetch one frame with depth and read
-        the depth there. Depth, not a ray to an assumed table height: the
-        table's real surface sits ~23mm above the configured `table`
-        obstacle, and the depth is what the camera actually measured.
-        """
         depth, (fx, fy, cx, cy), c2w = await self._depth_view()
         h, w = depth.shape
-        # Pixel in the depth frame (same size as colour on this camera).
         du, dv = int(u * w / img_w), int(v * h / img_h)
         r = LOCATE_WINDOW_PX
         patch = depth[max(dv - r, 0):dv + r + 1, max(du - r, 0):du + r + 1]
@@ -433,7 +372,6 @@ class Robot:
         if len(valid) < 10:
             raise RuntimeError("no depth reading at that spot; click somewhere else")
         z = float(np.median(valid))
-
         p_cam = np.array([(du - cx) * z / fx, (dv - cy) * z / fy, z])
         p = c2w[:3, :3] @ p_cam + c2w[:3, 3]
         print(f"target point: pixel ({du}, {dv}) -> world "
@@ -441,7 +379,6 @@ class Robot:
         return tuple(round(float(c), 1) for c in p)
 
     async def _depth_view(self):
-        """(depth mm, intrinsics scaled to it, cam->world 4x4) for right now."""
         machine = await self._connected()
         name = os.environ.get("VIAM_CAMERA", "cam")
         cam = await ts.resolve(machine, Camera, name)
@@ -457,12 +394,6 @@ class Robot:
         return depth, intr, await ts._cam_to_world(machine, name)
 
     async def trace_path(self, pixels: list, img_w: int, img_h: int) -> list:
-        """World waypoints [(x, y, table z), ...] under a path drawn in pixels.
-
-        Each pixel's ray is met with the table plane fitted from depth, not
-        with the depth at that pixel: where the path crosses an object it
-        must stay down at the table, not ride up over the object's top.
-        """
         depth, (fx, fy, cx, cy), c2w = await self._depth_view()
         h, w = depth.shape
         v, u = np.nonzero(depth > 0)
@@ -496,8 +427,6 @@ class Robot:
             arm=self.arm,
             gripper=await ts.resolve(machine, Gripper, tc.GRIPPER_NAME),
         )
-        # Opening a gripper that holds something would drop it wherever the
-        # arm happens to be.
         if (await rig.gripper.is_holding_something()).is_holding_something:
             raise RuntimeError("gripper already reports holding something; "
                                "clear it before running")
@@ -509,8 +438,6 @@ class Robot:
         try:
             return await coro
         except BaseException:
-            # Stop button (task cancelled) or an unexpected error mid-motion:
-            # halt the arm where it is rather than plan a move nobody asked for.
             print("Interrupted — stopping arm.", file=sys.stderr)
             try:
                 await rig.arm.stop()
@@ -519,7 +446,6 @@ class Robot:
             raise
 
     async def pick(self, targets: list[dict], objects: list[dict]) -> list[str]:
-        """table_cleanup.run()'s pick loop, for a chosen list of objects."""
         rig = await self._rig()
         return await self._guarded(rig, self._pick(rig, targets, objects))
 
@@ -538,14 +464,12 @@ class Robot:
                 outcomes.append("Stopped: the gripper is still holding an "
                                 "object; remaining picks skipped.")
                 break
-
         print("Returning home.")
         await tc.move(rig, tc.HOME_POSE, "home", tc.world_state(on_table),
                       component=tc.ARM_NAME)
         return outcomes
 
     async def place(self, obj: dict, point: tuple, objects: list[dict]) -> list[str]:
-        """Pick obj up and set it down centred on point, keeping its heading."""
         rig = await self._rig()
         return await self._guarded(rig, self._place(rig, obj, point, objects))
 
@@ -555,10 +479,6 @@ class Robot:
         world = tc.world_state(others)
         x, y, z = tc.grasp_point(obj["position"])
         tx, ty = point[0], point[1]
-        # Keep the grasp roll the whole way, so the object lands with the
-        # heading it had, and release at exactly the height it was grabbed
-        # at: both spots are the same tabletop, so it's set down as it was
-        # picked up, independent of any absolute table height.
         th = tc.grasp_theta(obj["position"])
         release_z = z
         print(f"  -> {obj['name']} to ({tx:.1f}, {ty:.1f})")
@@ -578,8 +498,6 @@ class Robot:
             await tc.move(rig, tc.HOME_POSE, "home", world, component=tc.ARM_NAME)
             return [f"grab failed (grab()={grabbed}, holding={holding})"]
 
-        # From here a failure leaves the object in the gripper: stop there
-        # and say so, rather than open the jaws somewhere unplanned.
         steps = [
             (tc.down_at(x, y, tc.SAFE_HEIGHT_MM, th), "lift", True),
             (tc.down_at(tx, ty, tc.SAFE_HEIGHT_MM, th), "transit above target", False),
@@ -597,7 +515,6 @@ class Robot:
         if still:
             return ["release did not let go (still reports holding)"]
 
-        # The object now sits at the target; avoid it on the way home.
         moved = shifted(obj, tx - obj["position"]["centroid"][0],
                         ty - obj["position"]["centroid"][1])
         print("Returning home.")
@@ -606,9 +523,8 @@ class Robot:
         return [f"{obj['name']}: placed at ({tx:.0f}, {ty:.0f}) mm"]
 
     async def sweep(self, path: list, objects: list[dict]) -> list[str]:
-        """Drag the closed gripper along path, just above the table, slowly."""
         rig = await self._rig()
-        await rig.gripper.grab()  # close on nothing: a solid pusher
+        await rig.gripper.grab()
         if (await rig.gripper.is_holding_something()).is_holding_something:
             await rig.gripper.open()
             raise RuntimeError("gripper reports holding something after closing; "
@@ -616,8 +532,6 @@ class Robot:
         try:
             return await self._guarded(rig, self._sweep(rig, path, objects))
         finally:
-            # Whatever happened — STOP, a failed move, a fault — never leave
-            # the arm at sweep speed for the next job.
             try:
                 await rig.arm.do_command({
                     "set_speed": ARM_NORMAL_SPEED_DEGS_PER_SEC,
@@ -630,9 +544,8 @@ class Robot:
         th = sweep_theta(path[0], path[-1])
         lift = tc.CLAW_REACH_MM + SWEEP_CLEARANCE_MM
         sx, sy, sz = path[0]
-        free = WorldState()  # objects are there to be pushed, not avoided
+        free = WorldState()
 
-        # In over the start at normal speed, avoiding everything on the table.
         if not await tc.move(rig, tc.down_at(sx, sy, tc.SAFE_HEIGHT_MM, th),
                              "transit above path start", tc.world_state(located(objects))):
             return await self._sweep_home(rig, "move above the path start failed")
@@ -650,11 +563,6 @@ class Robot:
         return await self._sweep_home(rig, th, f"swept {path_length(path):.0f} mm")
 
     async def _sweep_home(self, rig, th: float, outcome: str) -> list[str]:
-        """Straight up from wherever the gripper is, open, then home.
-
-        Up first: a free move home from down at the table could swing
-        sideways through the objects just pushed.
-        """
         p = (await rig.motion.get_pose(tc.GRIPPER_NAME, "world")).pose
         if not await sweep_move(rig, tc.down_at(p.x, p.y, tc.SAFE_HEIGHT_MM, th),
                                 "lift after sweep", WorldState()):
@@ -663,10 +571,24 @@ class Robot:
                     "jog it up before anything else."]
         await rig.gripper.open()
         print("Returning home.")
-        # Object positions are stale after pushing, so only the frame
-        # system's table/walls/ceiling are obstacles on the way home.
         await tc.move(rig, tc.HOME_POSE, "home", WorldState(), component=tc.ARM_NAME)
         return [outcome]
+
+    async def reconstruct(self, objects: list[dict], bridge) -> tr.ReconstructResult:
+        """Orbit the scene, build Poisson mesh, mark all grasp points in render."""
+        machine = await self._connected()
+
+        def on_progress(i: int, n: int):
+            bridge.reconstruct_progress.emit(i, n)
+
+        return await tr.reconstruct(
+            machine,
+            objects,
+            n_poses=RECONSTRUCT_N_POSES,
+            radius=RECONSTRUCT_RADIUS_MM,
+            height=RECONSTRUCT_HEIGHT_MM,
+            on_progress=on_progress,
+        )
 
     async def clear_error(self) -> list[str]:
         await self._connected()
@@ -686,21 +608,15 @@ class Robot:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
 
-# Jobs that move the arm: STOP applies to these, and nothing else may start.
-MOVING = ("pick", "place", "sweep")
+MOVING = ("pick", "place", "sweep", "reconstruct")
 
 CONFIRM_HINT = "<br>Press <b>Execute plan</b> or reply <b>go</b> to start."
 
 
 class ClickLabel(QLabel):
-    """A QLabel that reports clicks and drawn strokes in its own coordinates.
-
-    A left-button press that moves less than DRAG_THRESHOLD_PX before release
-    is a click; more than that, it's a stroke.
-    """
-    clicked = pyqtSignal(int, int, int)  # x, y, Qt.MouseButton
-    stroking = pyqtSignal(list)          # [(x, y), ...] so far, while drawing
-    stroked = pyqtSignal(list)           # [(x, y), ...] on release
+    clicked = pyqtSignal(int, int, int)
+    stroking = pyqtSignal(list)
+    stroked = pyqtSignal(list)
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -734,15 +650,13 @@ class ClickLabel(QLabel):
 
 
 class Bridge(QObject):
-    """Carries results from the robot thread to the GUI thread."""
     log = pyqtSignal(str)
-    done = pyqtSignal(str, object, object)  # kind, result, error
-    frame = pyqtSignal(bytes)               # a live-feed JPEG
+    done = pyqtSignal(str, object, object)
+    frame = pyqtSignal(bytes)
+    reconstruct_progress = pyqtSignal(int, int)   # i, n_poses
 
 
 class LogStream:
-    """stdout/stderr replacement: everything printed also lands in the log pane."""
-
     def __init__(self, bridge: Bridge, original):
         self.bridge, self.original = bridge, original
 
@@ -752,7 +666,6 @@ class LogStream:
         if self.original:
             self.original.write(text)
         if text:
-            # viam's logger colours its output for terminals.
             self.bridge.log.emit(self.ANSI.sub("", text))
 
     def flush(self):
@@ -770,35 +683,31 @@ class Window(QMainWindow):
         self.bridge = Bridge()
         self.bridge.log.connect(self._append_log)
         self.bridge.done.connect(self._finished)
+        self.bridge.reconstruct_progress.connect(self._reconstruct_progress)
         sys.stdout = LogStream(self.bridge, sys.__stdout__)
         sys.stderr = LogStream(self.bridge, sys.__stderr__)
 
         self.objects: list[dict] = []
         self.marked: bytes | None = None
-        # The plan waiting for confirmation:
-        #   {"kind": "pick"|"place", "targets": [obj, ...], "point": (x, y, z)|None}
         self.pending: dict | None = None
-        # The clicked point: {"px": (u, v) in camera pixels, "world": (x, y, z) mm}
         self.target: dict | None = None
-        # The drawn sweep path: camera pixels as drawn, and the world
-        # waypoints traced from them (None until tracing finishes).
         self.path_px: list | None = None
         self.path: list | None = None
         self.history: list[dict] = []
-        self.busy = None       # name of the running job, or None
-        self.job = None        # its concurrent Future
+        self.busy = None
+        self.job = None
+        self.last_reconstruct: tr.ReconstructResult | None = None
 
         self._build()
         self._say("robot", "Hi. Press <b>Scan</b> (or just tell me what to "
                   "throw away) and I'll look at the table first. To move "
                   "something instead, click a spot on the live feed, then "
                   "tell me which object to put there. To push things aside, "
-                  "drag a path across the live feed.")
+                  "drag a path across the live feed. Press <b>3D Scan</b> to "
+                  "orbit the scene and build a Poisson mesh with grasp points marked.")
 
         self.live_pix: QPixmap | None = None
         self.bridge.frame.connect(self._show_live)
-        # The feed runs on the robot thread, which must not touch widgets;
-        # it reads this plain flag instead of the checkbox.
         self.live_enabled = True
         self.live_on.toggled.connect(lambda on: setattr(self, "live_enabled", on))
         self.feed = self.robot.submit(self.robot.feed(
@@ -822,7 +731,6 @@ class Window(QMainWindow):
         self.live.clicked.connect(self._live_clicked)
         self.live.stroking.connect(self._live_stroking)
         self.live.stroked.connect(self._live_stroked)
-        self.image = self._picture("No scan yet")
         self.live_on = QCheckBox("Live feed")
         self.live_on.setChecked(True)
 
@@ -836,6 +744,11 @@ class Window(QMainWindow):
         hdr.setSectionResizeMode(3, QHeaderView.Stretch)
 
         self.scan_btn = QPushButton("Scan")
+        self.reconstruct_btn = QPushButton("3D Scan")
+        self.reconstruct_btn.setToolTip(
+            "Orbit the arm around the scene, run Poisson mesh reconstruction, "
+            "and display grasp points for all pickable objects in the 3D view tab."
+        )
         self.exec_btn = QPushButton("Execute plan")
         self.stop_btn = QPushButton("STOP")
         self.stop_btn.setStyleSheet(
@@ -845,12 +758,13 @@ class Window(QMainWindow):
         self.clear_btn.setToolTip("After a collision fault (e.g. the fingers touched "
                                   "the table), remove the cause, then press this.")
         self.scan_btn.clicked.connect(lambda: self._start_scan())
+        self.reconstruct_btn.clicked.connect(self._start_reconstruct)
         self.exec_btn.clicked.connect(self._execute)
         self.stop_btn.clicked.connect(self._stop)
         self.clear_btn.clicked.connect(
             lambda: self._run("clear", self.robot.clear_error()))
         buttons = QHBoxLayout()
-        for b in (self.scan_btn, self.exec_btn, self.clear_btn):
+        for b in (self.scan_btn, self.reconstruct_btn, self.exec_btn, self.clear_btn):
             buttons.addWidget(b)
         buttons.addWidget(self.live_on)
         buttons.addStretch()
@@ -874,7 +788,37 @@ class Window(QMainWindow):
         self.log.setMaximumBlockCount(5000)
         self.log.setFont(QFont("monospace", 9))
 
-        # Left: live camera on top, then the object list, controls and log.
+        # ── Bottom-right: tabbed panel with flat scan + 3D view ──
+        self.image_tabs = QTabWidget()
+        self.image_tabs.setDocumentMode(True)
+
+        # Tab 0: flat scan image
+        self.image = self._picture("No scan yet")
+        self.image_tabs.addTab(self.image, "Scan")
+
+        # Tab 1: 3D reconstruction view
+        mesh_container = QWidget()
+        mesh_vbox = QVBoxLayout(mesh_container)
+        mesh_vbox.setContentsMargins(0, 0, 0, 0)
+        mesh_vbox.setSpacing(4)
+
+        self.mesh_view = self._picture("No 3D scan yet")
+        self.mesh_progress = QProgressBar()
+        self.mesh_progress.setRange(0, RECONSTRUCT_N_POSES)
+        self.mesh_progress.setTextVisible(True)
+        self.mesh_progress.setFormat("Orbit: %v / %m viewpoints")
+        self.mesh_progress.setMaximumHeight(18)
+        self.mesh_progress.setVisible(False)
+        self.mesh_info = QLabel("")
+        self.mesh_info.setAlignment(Qt.AlignCenter)
+        self.mesh_info.setStyleSheet("font-size: 11px; color: #aaa; padding: 2px;")
+
+        mesh_vbox.addWidget(self.mesh_view)
+        mesh_vbox.addWidget(self.mesh_progress)
+        mesh_vbox.addWidget(self.mesh_info)
+        self.image_tabs.addTab(mesh_container, "3D view")
+
+        # Left pane
         controls = QWidget()
         bv = QVBoxLayout(controls)
         bv.setContentsMargins(0, 0, 0, 0)
@@ -886,7 +830,7 @@ class Window(QMainWindow):
         left.addWidget(self.log)
         left.setSizes([450, 250, 150])
 
-        # Right: chat on top, the last scan's marked image below it.
+        # Right pane
         chat_box = QWidget()
         cv = QVBoxLayout(chat_box)
         cv.setContentsMargins(0, 0, 0, 0)
@@ -894,7 +838,7 @@ class Window(QMainWindow):
         cv.addLayout(row)
         right = QSplitter(Qt.Vertical)
         right.addWidget(chat_box)
-        right.addWidget(self.image)
+        right.addWidget(self.image_tabs)
         right.setSizes([450, 400])
         for s in (left, right):
             s.splitterMoved.connect(lambda *_: self._rescale())
@@ -921,25 +865,30 @@ class Window(QMainWindow):
     def _refresh_controls(self):
         idle = self.busy is None
         self.scan_btn.setEnabled(idle)
+        self.reconstruct_btn.setEnabled(idle and bool(self.objects))
         self.clear_btn.setEnabled(idle)
         self.exec_btn.setEnabled(idle and bool(self.pending))
         self.input.setEnabled(idle)
         self.send_btn.setEnabled(idle)
         self.stop_btn.setEnabled(self.busy in MOVING)
-        status = {None: "Ready", "scan": "Scanning the table...",
-                  "chat": "Thinking...", "locate": "Locating the clicked point...",
-                  "trace": "Tracing the path onto the table...",
-                  "clear": "Clearing the arm error...",
-                  "pick": "Arm moving — STOP halts it",
-                  "place": "Arm moving — STOP halts it",
-                  "sweep": "Sweeping slowly — STOP halts it"}[self.busy]
+        status = {
+            None: "Ready",
+            "scan": "Scanning the table...",
+            "chat": "Thinking...",
+            "locate": "Locating the clicked point...",
+            "trace": "Tracing the path onto the table...",
+            "clear": "Clearing the arm error...",
+            "pick": "Arm moving — STOP halts it",
+            "place": "Arm moving — STOP halts it",
+            "sweep": "Sweeping slowly — STOP halts it",
+            "reconstruct": f"Orbiting + reconstructing ({RECONSTRUCT_N_POSES} poses) — STOP halts arm",
+        }[self.busy]
         if self.target and idle:
             x, y, _ = self.target["world"]
             status += f"   |   target point ({x:.0f}, {y:.0f}) mm"
         self.statusBar().showMessage(status)
 
     def _run(self, kind: str, coro, context=None):
-        """Run a coroutine on the robot loop; _finished gets (kind, result, error)."""
         self.busy = kind
         self._refresh_controls()
         self.job = self.robot.submit(coro)
@@ -961,12 +910,6 @@ class Window(QMainWindow):
                                    Qt.SmoothTransformation))
 
     def _with_marker(self, pix: QPixmap) -> QPixmap:
-        """pix with the target point drawn on it, if one is set.
-
-        The point is kept as a camera pixel, which only matches the scene
-        while the camera is where it was at the click — true whenever the
-        arm is at home, which is where it idles and scans from.
-        """
         if not self.target and not self.path_px:
             return pix
         pix = pix.copy()
@@ -975,13 +918,11 @@ class Window(QMainWindow):
         p.setRenderHint(QPainter.Antialiasing)
         if self.path_px and len(self.path_px) > 1:
             pts = [(int(u), int(v)) for u, v in self.path_px]
-            # Dashed while it's being drawn or traced, solid once it's a plan.
             style = Qt.SolidLine if self.path else Qt.DashLine
             for colour, width in ((QColor("black"), 8), (QColor("#ff9100"), 4)):
                 p.setPen(QPen(colour, width, style, Qt.RoundCap, Qt.RoundJoin))
                 for a, b in zip(pts, pts[1:]):
                     p.drawLine(a[0], a[1], b[0], b[1])
-            # Start dot and an arrowhead at the end.
             p.setPen(QPen(QColor("black"), 2))
             p.setBrush(QColor("#ff9100"))
             p.drawEllipse(pts[0][0] - r // 2, pts[0][1] - r // 2, r, r)
@@ -1017,12 +958,12 @@ class Window(QMainWindow):
             pix = QPixmap()
             pix.loadFromData(self.marked)
             self._fit(self.image, self._with_marker(pix))
+        if self.last_reconstruct is not None:
+            pix = QPixmap()
+            if pix.loadFromData(self.last_reconstruct.render_jpeg):
+                self._fit(self.mesh_view, pix)
 
     def _to_image(self, x: float, y: float, clamp: bool = False):
-        """Label coordinates -> camera-image pixel, or None if off the picture.
-
-        The pixmap is centred in the label, scaled down from the camera image.
-        """
         shown = self.live.pixmap()
         if self.live_pix is None or shown is None or shown.isNull():
             return None
@@ -1038,8 +979,6 @@ class Window(QMainWindow):
 
     def _can_mark(self) -> bool:
         if self.busy:
-            # The camera rides on the arm: a mark made while it moves would be
-            # read against a pose that no longer matches the picture.
             self.statusBar().showMessage("Wait until the current job finishes "
                                          "before marking the feed.", 4000)
             return False
@@ -1110,6 +1049,36 @@ class Window(QMainWindow):
         self.pending = None
         self._run("scan", self.robot.scan(), then_message)
 
+    def _start_reconstruct(self):
+        if self.busy or not self.objects:
+            return
+        n_located = sum(1 for o in self.objects
+                        if o.get("position") and "centroid" in o["position"])
+        if n_located == 0:
+            self._say("error", "Run a scan first so I have object positions to orbit.")
+            return
+        n_pickable = sum(1 for o in self.objects if tc.gate(o["position"]) is None)
+        self._say(
+            "robot",
+            f"Starting 3D scene scan — {RECONSTRUCT_N_POSES} orbit viewpoints around "
+            f"the mean centroid of {n_located} located object(s). "
+            f"{n_pickable} pickable object(s) will be marked in the render. "
+            "Press <b>STOP</b> to halt the arm."
+        )
+        self.mesh_progress.setMaximum(RECONSTRUCT_N_POSES)
+        self.mesh_progress.setValue(0)
+        self.mesh_progress.setVisible(True)
+        self.mesh_info.setText("Starting orbit…")
+        self.image_tabs.setCurrentIndex(1)
+        self._run("reconstruct", self.robot.reconstruct(self.objects, self.bridge))
+
+    def _reconstruct_progress(self, i: int, n: int):
+        self.mesh_progress.setValue(i)
+        if i < n:
+            self.mesh_info.setText(f"Capturing viewpoint {i}/{n}…")
+        else:
+            self.mesh_info.setText("Running Poisson reconstruction…")
+
     def _send(self):
         text = self.input.text().strip()
         if not text or self.busy:
@@ -1117,7 +1086,6 @@ class Window(QMainWindow):
         self.input.clear()
         self._say("you", text)
         if not self.objects:
-            # Nothing to reason about yet: look first, then answer.
             self._say("robot", "Let me look at the table first.")
             self._start_scan(then_message=text)
             return
@@ -1154,15 +1122,12 @@ class Window(QMainWindow):
             self._run("pick", self.robot.pick(plan["targets"], self.objects))
 
     def _stop(self):
-        # Cancelling the job raises inside the pick loop, which stops the arm;
-        # the direct stop covers the moment before cancellation lands.
         self.robot.submit(self.robot.stop_arm())
         if self.job is not None:
             self.robot.loop.call_soon_threadsafe(self.job.cancel)
         self._say("error", "STOP pressed — arm halted where it is.")
 
     def _plan(self, ids: list[str]) -> str:
-        """Turn Claude's chosen ids into a pending plan; describe it."""
         by_id = {o["id"]: o for o in self.objects}
         chosen = [by_id[i] for i in ids if i in by_id]
         ok = [o for o in chosen if tc.gate(o["position"]) is None]
@@ -1183,7 +1148,6 @@ class Window(QMainWindow):
         return "<br>".join(lines) + tail
 
     def _plan_sweep(self) -> str:
-        """Turn the traced path into a pending plan; describe it."""
         self.pending = None
         if not self.path:
             return "Drag a path across the live feed first."
@@ -1205,7 +1169,6 @@ class Window(QMainWindow):
                 + CONFIRM_HINT)
 
     def _plan_place(self, ids: list[str]) -> str:
-        """Turn Claude's chosen object and the clicked point into a pending plan."""
         self.pending = None
         by_id = {o["id"]: o for o in self.objects}
         chosen = [by_id[i] for i in ids if i in by_id]
@@ -1240,6 +1203,9 @@ class Window(QMainWindow):
             if kind == "trace":
                 self.path_px = None
                 self._rescale()
+            if kind == "reconstruct":
+                self.mesh_progress.setVisible(False)
+                self.mesh_info.setText("Reconstruction failed — see log.")
             self._refresh_controls()
             return
 
@@ -1265,15 +1231,38 @@ class Window(QMainWindow):
         elif kind == "scan":
             scan, self.marked = result
             self.objects = scan["objects"]
-            self.history.clear()  # old turns refer to ids from the old scan
+            self.history.clear()
             n_trash = sum(o["is_trash"] for o in self.objects)
             self._say("robot", f"I see {len(self.objects)} object(s), "
                       f"{n_trash} of them look like trash.")
             self._show_scan()
-            if context:  # a message was waiting for this scan
+            if context:
                 self._refresh_controls()
                 self._ask(context)
                 return
+        elif kind == "reconstruct":
+            result: tr.ReconstructResult
+            self.last_reconstruct = result
+            pix = QPixmap()
+            if pix.loadFromData(result.render_jpeg):
+                self._fit(self.mesh_view, pix)
+            self.mesh_progress.setVisible(False)
+            grasp_summary = (
+                f"{len(result.grasp_points)} grasp point(s) marked"
+                if result.grasp_points else "no pickable objects to mark"
+            )
+            self.mesh_info.setText(
+                f"{result.n_triangles:,} triangles · "
+                f"{result.n_views}/{RECONSTRUCT_N_POSES} views · "
+                f"{grasp_summary}"
+            )
+            self._say(
+                "robot",
+                f"3D scan complete: <b>{result.n_triangles:,} triangles</b> from "
+                f"{result.n_views} viewpoints, {result.n_points:,} points. "
+                f"{grasp_summary.capitalize()}. "
+                f"Mesh saved to <code>{result.mesh_ply}</code>."
+            )
         elif kind == "chat":
             action, reply = result["action"], result["reply"]
             self.history += [{"role": "user", "content": context},
@@ -1301,7 +1290,7 @@ class Window(QMainWindow):
                 self._say("robot", "There's no plan waiting to confirm.")
         elif kind in MOVING:
             if kind == "place" and "placed at" in result[-1]:
-                self.target = None  # used; the next move needs a fresh click
+                self.target = None
             if kind == "sweep":
                 self.path_px = self.path = None
             self._say("robot", "<br>".join(result) + "<br>Scanning again...")

@@ -431,7 +431,19 @@ class Robot:
             raise RuntimeError("gripper already reports holding something; "
                                "clear it before running")
         await rig.gripper.open()
+        # Where the arm is now is where this action returns it to at the end.
+        self.start_pose = await rig.arm.get_end_position()
         return rig
+
+    async def _go_back(self, rig: tc.Rig, world: WorldState) -> list[str]:
+        """Return the arm to where this action started. [] if it got there,
+        else a message for the chat."""
+        s = self.start_pose
+        print(f"Returning to the starting position ({s.x:.0f}, {s.y:.0f}, {s.z:.0f}).")
+        if await tc.return_to_start(rig, s, world):
+            return []
+        return ["Could not get back to the starting position: the arm is stopped "
+                "where it is. Press Clear arm error first if it faulted."]
 
     @staticmethod
     async def _guarded(rig: tc.Rig, coro):
@@ -464,10 +476,7 @@ class Robot:
                 outcomes.append("Stopped: the gripper is still holding an "
                                 "object; remaining picks skipped.")
                 break
-        print("Returning home.")
-        await tc.move(rig, tc.HOME_POSE, "home", tc.world_state(on_table),
-                      component=tc.ARM_NAME)
-        return outcomes
+        return outcomes + await self._go_back(rig, tc.world_state(on_table))
 
     async def place(self, obj: dict, point: tuple, objects: list[dict]) -> list[str]:
         rig = await self._rig()
@@ -495,8 +504,8 @@ class Robot:
             await rig.gripper.open()
             await tc.move(rig, tc.down_at(x, y, tc.SAFE_HEIGHT_MM, th),
                           "retreat after failed grab", world, straight=True)
-            await tc.move(rig, tc.HOME_POSE, "home", world, component=tc.ARM_NAME)
-            return [f"grab failed (grab()={grabbed}, holding={holding})"]
+            return ([f"grab failed (grab()={grabbed}, holding={holding})"]
+                    + await self._go_back(rig, world))
 
         steps = [
             (tc.down_at(x, y, tc.SAFE_HEIGHT_MM, th), "lift", True),
@@ -517,10 +526,8 @@ class Robot:
 
         moved = shifted(obj, tx - obj["position"]["centroid"][0],
                         ty - obj["position"]["centroid"][1])
-        print("Returning home.")
-        await tc.move(rig, tc.HOME_POSE, "home", tc.world_state(others + [moved]),
-                      component=tc.ARM_NAME)
-        return [f"{obj['name']}: placed at ({tx:.0f}, {ty:.0f}) mm"]
+        return ([f"{obj['name']}: placed at ({tx:.0f}, {ty:.0f}) mm"]
+                + await self._go_back(rig, tc.world_state(others + [moved])))
 
     async def sweep(self, path: list, objects: list[dict]) -> list[str]:
         rig = await self._rig()
@@ -548,7 +555,7 @@ class Robot:
 
         if not await tc.move(rig, tc.down_at(sx, sy, tc.SAFE_HEIGHT_MM, th),
                              "transit above path start", tc.world_state(located(objects))):
-            return await self._sweep_home(rig, "move above the path start failed")
+            return await self._sweep_home(rig, th, "move above the path start failed")
 
         await rig.arm.do_command({"set_speed": SWEEP_SPEED_DEGS_PER_SEC,
                                   "set_acceleration": SWEEP_ACCEL_DEGS_PER_SEC2})
@@ -570,9 +577,12 @@ class Robot:
                     "the table. If the arm faulted, press Clear arm error, then "
                     "jog it up before anything else."]
         await rig.gripper.open()
-        print("Returning home.")
-        await tc.move(rig, tc.HOME_POSE, "home", WorldState(), component=tc.ARM_NAME)
-        return [outcome]
+        # Back to normal speed before the long move back: at sweep speed it
+        # crawls, and can run out the move timeout and be stopped part way.
+        # (sweep()'s finally restores it again, in case we never get here.)
+        await rig.arm.do_command({"set_speed": ARM_NORMAL_SPEED_DEGS_PER_SEC,
+                                  "set_acceleration": ARM_NORMAL_ACCEL_DEGS_PER_SEC2})
+        return [outcome] + await self._go_back(rig, WorldState())
 
     async def reconstruct(self, objects: list[dict], bridge) -> tr.ReconstructResult:
         """Orbit the scene, build Poisson mesh, mark all grasp points in render."""
@@ -588,6 +598,8 @@ class Robot:
             radius=RECONSTRUCT_RADIUS_MM,
             height=RECONSTRUCT_HEIGHT_MM,
             on_progress=on_progress,
+            # Come back to where the orbit started, not a fixed home pose.
+            return_pose=await self.arm.get_end_position(),
         )
 
     async def clear_error(self) -> list[str]:

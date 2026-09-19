@@ -111,12 +111,16 @@ async def orbit_scan(
     radius: float = ORBIT_RADIUS_MM,
     height: float = ORBIT_HEIGHT_MM,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    return_pose=None,
 ) -> list[np.ndarray]:
     """
     Drive the arm around center and collect depth clouds.
 
     center is a world-frame [x, y, z] mm point — typically the mean centroid
     of all located objects on the table, or a fixed workspace midpoint.
+
+    Afterwards the arm goes to return_pose (an arm Pose, e.g. where it was
+    before the orbit), or to tc.HOME_POSE when that is None.
 
     Uses the already-open machine connection. Returns a list of (N, 3) float32
     arrays in world-frame mm.
@@ -164,15 +168,15 @@ async def orbit_scan(
         if on_progress:
             on_progress(i + 1, n_poses)
 
-    # Return home.
-    tr_home = Pose(x=tc.HOME_POSE.x, y=tc.HOME_POSE.y, z=TRANSIT_HEIGHT_MM,
-                   o_x=0, o_y=0, o_z=-1, theta=0)
-    await _move(motion, tr_home, "transit home")
-    await motion.move(
-        component_name=tc.ARM_NAME,
-        destination=PoseInFrame(reference_frame="world", pose=tc.HOME_POSE),
-        timeout=tc.MOVE_TIMEOUT_S,
-    )
+    # Return to where the orbit started (or home), confirming the arm got there.
+    end = return_pose or tc.HOME_POSE
+    tr_end = Pose(x=end.x, y=end.y, z=TRANSIT_HEIGHT_MM,
+                  o_x=0, o_y=0, o_z=-1, theta=0)
+    await _move(motion, tr_end, "transit back")
+    rig = tc.Rig(motion=motion, arm=arm, gripper=None)
+    if not await tc.return_to_start(rig, end, None):
+        print("  !! could not get back to the starting position; the arm is "
+              "stopped where it is", file=sys.stderr)
     return clouds
 
 
@@ -389,6 +393,7 @@ async def reconstruct(
     radius: float = ORBIT_RADIUS_MM,
     height: float = ORBIT_HEIGHT_MM,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    return_pose=None,
 ) -> ReconstructResult:
     """
     Full pipeline: compute scene center → orbit → fuse → Poisson → render.
@@ -409,7 +414,8 @@ async def reconstruct(
     print(f"  Scene center: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}) mm "
           f"(mean of {len(located)} located objects)")
 
-    clouds = await orbit_scan(machine, center, n_poses, radius, height, on_progress)
+    clouds = await orbit_scan(machine, center, n_poses, radius, height, on_progress,
+                              return_pose)
 
     if not clouds:
         raise RuntimeError("No depth data captured.")

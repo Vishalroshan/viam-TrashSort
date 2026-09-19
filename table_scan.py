@@ -57,45 +57,54 @@ SUPPORTED_IMAGE_TYPES = {
 SYSTEM_PROMPT = """You are the perception stage of a tabletop tidying robot.
 
 You will be given a photo of a table, usually followed by a second copy of the
-same photo with numbered magenta boxes drawn on it. Identify EVERY distinct
-physical object resting on the table surface. Then decide, for each one,
-whether it is trash.
+same photo with numbered magenta boxes drawn on it. List every physical object
+resting on the table surface that a hand could pick up, and decide, for each
+one, whether it is trash.
+
+What counts as an object:
+- A separate, solid thing you could lift off the table: a can, a bottle, a
+  napkin, a block, a cap.
+- Never list marks on the table itself: stains, spills, dried residue,
+  shadows, reflections, glare, scratches, printed patterns, or patches of
+  empty table. If it lies flat in the surface and could only be wiped, not
+  lifted, it is not an object.
+- Never list the table, its edges, anything beyond the table (floor, walls,
+  cables hanging off the side), the robot arm or gripper, or anything a
+  person is holding.
+- One entry per object: three identical caps are three entries. Parts of one
+  object are not listed separately (a bottle and its attached cap are one).
+- Use a specific, concrete name: "crumpled paper napkin", not "paper". If you
+  cannot tell what it is, name it by its appearance ("small white cylindrical
+  object") and set confidence low.
+- If you are unsure whether something is an object or just a mark on the
+  table, leave it out.
 
 Rules for the numbered marks:
-- Each box is an object a depth sensor found; its number is the object's
-  `mark`. The boxes are accurate; judge what is inside each one from the
-  unmarked photo, where the drawing does not hide anything.
+- Each box is something a depth sensor found standing up off the table; its
+  number is the object's `mark`. The boxes are accurate; judge what is inside
+  each one from the unmarked photo, where the drawing does not hide anything.
 - Every mark number must be used by at least one entry. If a box holds
-  something that is not an object (a shadow, glare, a piece of the robot),
-  still list it, say what it is, and set is_trash false.
+  something that is not a pickable object (e.g. a piece of the robot), still
+  list it, say what it is, and set is_trash false.
 - If one box clearly holds two or more separate objects, list each object
   with that same mark number.
-- Objects with no box get mark 0. The depth sensor often misses clear
-  plastic and very shiny things, so look for those especially.
+- Objects with no box get mark 0. The depth sensor often misses clear plastic
+  and very shiny things, so look for those especially, but the rules above
+  still apply: a mark-0 entry must be a real object, never a stain or shadow.
 - When there is no marked copy, every object gets mark 0.
-
-Rules for identifying objects:
-- One entry per physical object. If there are three identical bottle caps,
-  emit three entries, not one.
-- Do not list the table itself, the tabletop surface, shadows, reflections,
-  or anything a person is holding.
-- Do not list parts of a larger object separately (a cup and its lid, while
-  attached, are one object).
-- Use a specific, concrete name: "crumpled paper napkin", not "paper".
-- If you cannot tell what something is, name it by its appearance
-  ("small white cylindrical object") and set confidence low.
 
 Rules for the trash judgment — this is about STATE and USE, not object class:
 - Trash: consumed, spent, damaged, or discarded items with no remaining
-  function. Food waste, wrappers, used napkins, empty containers, crumpled
-  paper, broken pieces, disposable cutlery that has been used. Empty containers only
-  when visibly empty (open top, crushed, no lid). A sealed or closed
-  can - is NOT trash regardless of apparent fullness. It may still contain contents.
-- Not trash: tools, electronics, cables, personal belongings, unopened or
-  partially full containers, reusable dishes, anything with obvious remaining
+  function. Food waste, wrappers, used napkins, crumpled paper, broken pieces,
+  used disposable cutlery, and containers that are visibly empty: open top,
+  crushed, or missing their lid.
+- Not trash: tools, electronics, cables, personal belongings, reusable dishes,
+  unopened or partially full containers, and anything with obvious remaining
   value or function.
-- Ambiguous cases default to is_trash: false. YOu cannot determine whether a closed
-  can is trash or not. always err on the side of caution. A false negative leaves a mess;
+- A sealed or closed can or bottle is NOT trash, however full or empty it
+  looks. You cannot see inside it, and it may still have contents.
+- Ambiguous cases default to is_trash: false. A false negative leaves a mess;
+
   a false positive throws away someone's keys. Prefer leaving the mess.
 - The `reason` field must state what you actually saw that drove the call,
   not a restatement of the label.
@@ -249,6 +258,14 @@ async def connect():
         api_key=os.environ["VIAM_API_KEY"],
         api_key_id=os.environ["VIAM_API_KEY_ID"],
     )
+    # The SDK's background health check pings the machine every 10s with a
+    # 1s timeout and, after three misses, tears down the connection — killing
+    # whatever arm move is in flight even though the machine carries on. Over
+    # this cloud link a reply can take longer than 1s, and that has cut off
+    # picks mid-move twice. Turn it off: a connection that is really gone
+    # still fails the next call on its own.
+    opts.check_connection_interval = 0
+    opts.attempt_reconnect_interval = 0
     address = os.environ.get(
         "VIAM_ADDRESS", "armfarm15-main.310sld03v2.viam.cloud")
     return await RobotClient.at_address(address, opts)

@@ -38,6 +38,7 @@ Run:
 import argparse
 import asyncio
 import json
+import math
 import sys
 from dataclasses import dataclass
 
@@ -288,10 +289,43 @@ async def pick_and_drop(rig: Rig, obj: dict, world: WorldState) -> tuple[str, bo
     return "dropped", False
 
 
+# How close the arm must get back to its starting pose to count as returned.
+RETURN_TOLERANCE_MM = 5.0
+RETURN_TOLERANCE_DEG = 3.0
+
+
+def pose_error(a: Pose, b: Pose) -> tuple[float, float]:
+    """(position error mm, orientation error deg) between two arm poses."""
+    dist = math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
+    u, v = (a.o_x, a.o_y, a.o_z), (b.o_x, b.o_y, b.o_z)
+    cos = sum(p * q for p, q in zip(u, v)) / (math.hypot(*u) * math.hypot(*v))
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+    roll = abs((a.theta - b.theta + 180.0) % 360.0 - 180.0)
+    return dist, max(tilt, roll)
+
+
+async def return_to_start(rig: Rig, start: Pose, world: WorldState) -> bool:
+    """Move the arm back to the pose it started in, and confirm it got there.
+
+    One retry: a plan can fail or stop short for reasons that don't repeat.
+    """
+    for attempt in (1, 2):
+        await move(rig, start, "starting position", world, component=ARM_NAME)
+        dist, ang = pose_error(await rig.arm.get_end_position(), start)
+        if dist <= RETURN_TOLERANCE_MM and ang <= RETURN_TOLERANCE_DEG:
+            print("Back at the starting position.")
+            return True
+        print(f"  not at the starting position after attempt {attempt}/2: "
+              f"{dist:.1f} mm and {ang:.1f} deg off", file=sys.stderr)
+    return False
+
+
 async def run(dry_run: bool, out_path: str) -> None:
     machine = await ts.connect()
     try:
         arm = await ts.resolve(machine, Arm, ARM_NAME)
+        # Where the arm is now is where it goes back to at the end.
+        start = await arm.get_end_position()
         frame = await ts.capture(machine)
         # World-frame targets should not depend on where the arm was at capture;
         # logging it makes a drift between runs diagnosable.
@@ -376,8 +410,11 @@ async def run(dry_run: bool, out_path: str) -> None:
                 print(f"  arm stop failed: {e}", file=sys.stderr)
             raise
 
-        print("Returning home.")
-        await move(rig, HOME_POSE, "home", world_state(on_table), component=ARM_NAME)
+        print(f"Returning to the starting position "
+              f"({start.x:.1f}, {start.y:.1f}, {start.z:.1f}).")
+        if not await return_to_start(rig, start, world_state(on_table)):
+            print("Could not get back to the starting position; the arm is "
+                  "stopped where it is.", file=sys.stderr)
     finally:
         await machine.close()
 

@@ -1,25 +1,28 @@
 # viam-TrashSort
 
-A robot arm that clears a table: it photographs what's on the surface, asks
-Claude which items are trash, locates each one in 3D, and picks the trash up.
+An intelligent robotic arm that autonomously identifies, sorts, and removes trash from a tabletop using visual perception, contextual reasoning, and 3D object localization.
+The system captures images of the workspace and reasons about whether an object should be classified as trash based on its appearance and context. For example, a sealed soda can is not trash, an open can may still contain an unfinished drink, while a crushed can is a strong indicator of waste. Once trash is identified, the robot localizes each object in 3D, picks it up, and deposits it into a designated bin.
+
+Beyond autonomous trash removal, the system provides an interactive user interface for object manipulation and workspace organization.
+
+- **Interactive Object Rearrangement:** When objects are too close together for reliable grasping, users can draw trajectories directly on the UI, guiding the robotic arm to push objects apart and create sufficient clearance.
+- **Language-Guided Manipulation:** Users can interact with the robot through a natural-language chat interface to specify which objects to pick up.
+- **Waypoint-Based Placement:** Once the trash has been cleared, users can reorganize their workspace by selecting target placement locations through the UI, allowing the robot to pick and place objects as desired.
+The project combines visual reasoning, 3D perception, robotic manipulation, and human-in-the-loop control to transform a cluttered tabletop into an organized workspace.
 
 Built on a [Viam](https://www.viam.com/) machine — an xArm with a wrist-mounted
 depth camera and a gripper.
 
 ## How it works
 
-Finding *where* things are and deciding *what* they are come from different
-places, each doing what it is good at:
+The system separates 3D object localization from semantic understanding, allowing each component to focus on what it does best.
 
-- **Where** — the machine's `obstacles-pointcloud` vision service removes the
-  table plane and clusters what's left into one point set per object.
-- **What** — Claude sees the photo plus a copy with a numbered box drawn around
-  each cluster, then names and classifies each number. It never has to produce
-  coordinates, which it does only approximately.
+- **Where — 3D Perception:** The robot's obstacles-pointcloud vision service processes the captured point cloud, removes the table plane, and clusters the remaining points into individual objects. Each cluster provides the spatial information needed for robotic manipulation.
+  
+- **What — Visual Reasoning:** Claude receives the original scene image alongside an annotated version containing numbered bounding boxes corresponding to the detected clusters. It identifies each object and determines whether it should be classified as trash based on its appearance and context. By associating semantic labels with numbered clusters, the system avoids relying on the approximate spatial coordinates produced by a vision-language model.
 
-Positions are reported in the `world` frame. The camera rides on the arm, so
-camera-frame coordinates shift whenever the arm moves and aren't a stable
-description of where anything is.
+**Coordinate Frames**
+All object positions are expressed in the world coordinate frame. Since the camera is mounted on the robotic arm, its position and orientation change as the arm moves. Transforming detected object positions from the camera frame into the world frame provides a consistent spatial reference for object localization, grasp planning, and manipulation.
 
 ## Layout
 

@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL = "claude-sonnet-5"
+MODEL = "claude-opus-5"
 
 # Mime types Claude's vision input accepts, keyed by what the camera reports.
 # Anything else (depth frames, point clouds) is not a still image we can send.
@@ -508,7 +508,8 @@ def level_to_table(depth: np.ndarray, intrinsics: tuple,
     for _ in range(5):
         a = np.column_stack([world[keep, 0], world[keep, 1], ones[keep]])
         coef, *_ = np.linalg.lstsq(a, world[keep, 2], rcond=None)
-        resid = world[:, 2] - np.column_stack([world[:, 0], world[:, 1], ones]) @ coef
+        resid = world[:, 2] - \
+            np.column_stack([world[:, 0], world[:, 1], ones]) @ coef
         spread = max(1.4826 * float(np.median(np.abs(resid[keep]))), 0.5)
         keep = np.abs(resid) < 3 * spread
     if keep.sum() < 1000:
@@ -537,6 +538,7 @@ def level_to_table(depth: np.ndarray, intrinsics: tuple,
     fix[:3, 3] = np.array([ox, oy, TABLE_TOP_Z_MM]) - rot @ under
     return fix @ cam_to_world, (f"camera levelled to the table: corrected "
                                 f"{tilt:.1f} deg of tilt and {shift:+.1f} mm of height")
+
 
 # Fragments whose world-frame footprints come within this distance of each
 # other are one object. The segmenter over-splits: a crushed can came back as
@@ -623,7 +625,8 @@ def group_objects(frame: Frame) -> list[np.ndarray]:
         z = (o @ rot.T + shift)[:, 2]
         return np.percentile(z, 90) - TABLE_TOP_Z_MM >= MIN_OBJECT_HEIGHT_MM
 
-    objects = [o for o in objects if len(o) >= MIN_OBJECT_POINTS and stands_up(o)]
+    objects = [o for o in objects if len(
+        o) >= MIN_OBJECT_POINTS and stands_up(o)]
     return sorted(objects, key=lambda o: float(np.median(_project(frame, o)[0])))
 
 

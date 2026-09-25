@@ -1,4 +1,7 @@
 import asyncio
+import os
+
+from dotenv import load_dotenv
 from viam.robot.client import RobotClient
 from viam.services.vision import VisionClient
 from viam.services.motion import MotionClient
@@ -7,11 +10,12 @@ from viam.components.gripper import GripperClient
 from viam.proto.common import Pose, PoseInFrame
 
 async def main():
+    load_dotenv()
     robot = await RobotClient.at_address(
-        'armfarm15-main.310sld03v2.viam.cloud',
+        os.environ.get("VIAM_ADDRESS", "armfarm15-main.310sld03v2.viam.cloud"),
         RobotClient.Options.with_api_key(
-            api_key='VIAM_API_KEY_REDACTED',
-            api_key_id='VIAM_API_KEY_ID_REDACTED'
+            api_key=os.environ["VIAM_API_KEY"],
+            api_key_id=os.environ["VIAM_API_KEY_ID"],
         )
     )
 

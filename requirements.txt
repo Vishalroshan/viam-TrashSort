@@ -1,0 +1,14 @@
+# Core: needed by every script here.
+viam-sdk>=0.80.0
+anthropic>=1.7.0
+python-dotenv>=1.2.3
+numpy>=2.5.3
+pillow>=12.3.0
+
+# 3D reconstruction (table_orbit_scan.py --reconstruct, table_reconstruct.py)
+# and the mesh render fallback.
+open3d>=0.20.0
+matplotlib>=3.11.2
+
+# Desktop chat UI (cleanup_ui.py) only.
+PyQt5>=5.15.11

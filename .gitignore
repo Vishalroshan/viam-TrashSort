@@ -1,8 +1,14 @@
+# Secrets
 .env
-frame.jpg
-frame.png
-table_objects.json
-__pycache__/
+
+# Local environment and editor state
 .venv/
 .vscode/
-run.py
+__pycache__/
+
+# Scan and reconstruction output
+test.jpeg
+frame*.jpg
+frame*.png
+table_objects*.json
+*.ply

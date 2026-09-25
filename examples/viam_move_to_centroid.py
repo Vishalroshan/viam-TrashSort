@@ -1,5 +1,6 @@
 import asyncio
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from viam.robot.client import RobotClient
@@ -10,7 +11,7 @@ from viam.components.gripper import GripperClient
 from viam.proto.common import Pose, PoseInFrame
 
 async def main():
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     robot = await RobotClient.at_address(
         os.environ.get("VIAM_ADDRESS", "armfarm15-main.310sld03v2.viam.cloud"),
         RobotClient.Options.with_api_key(

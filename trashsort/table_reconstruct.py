@@ -25,9 +25,7 @@ Public API used by cleanup_ui.py:
     ReconstructResult
         Dataclass returned from the high-level reconstruct() helper.
 
-Setup:
-    .venv/bin/pip install viam-sdk anthropic python-dotenv numpy pillow
-    .venv/bin/pip install open3d
+Setup: see README.md; this module additionally needs open3d.
 """
 
 from __future__ import annotations
@@ -41,9 +39,10 @@ from typing import Callable, Optional
 
 import numpy as np
 
-import table_scan as ts
-import table_cleanup as tc
-from table_orbit_scan import (
+from . import table_scan as ts
+from . import table_cleanup as tc
+from .paths import out_path as _out
+from .table_orbit_scan import (
     orbit_poses,
     transit_pose,
     deproject_frame,
@@ -433,11 +432,11 @@ async def reconstruct(
     render_jpeg = await asyncio.to_thread(render_mesh, mesh, grasp_points)
 
     merged = np.vstack(clouds)
-    cloud_path = "orbit_cloud.ply"
+    cloud_path = _out("orbit_cloud.ply")
     save_ply(voxel_downsample(merged, VOXEL_MM) if VOXEL_MM > 0 else merged,
              cloud_path)
 
-    mesh_path = "orbit_mesh.ply"
+    mesh_path = _out("orbit_mesh.ply")
     o3d.io.write_triangle_mesh(mesh_path, mesh)
 
     return ReconstructResult(

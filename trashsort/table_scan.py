@@ -17,15 +17,14 @@ Results are reported in the `world` frame: the camera is mounted on the arm,
 so camera-frame coordinates move whenever the arm does and are not a stable
 description of where a thing is.
 
-Output: table_objects.json  (plus frame.jpg and frame_marked.jpg for debugging)
+Output (all in output/): table_objects.json, plus frame.jpg and
+frame_marked.jpg for debugging.
 
-Setup:
-    .venv/bin/pip install viam-sdk anthropic python-dotenv numpy pillow
-    cp .env.example .env    # then fill it in
+Setup: see README.md — pip install -r requirements.txt, then fill in .env.
 
-Run:
-    .venv/bin/python table_scan.py
-    .venv/bin/python table_scan.py --image test.jpeg   # prompt only, no 3D
+Run, from the repo root:
+    python -m trashsort.table_scan
+    python -m trashsort.table_scan --image photo.jpg   # prompt only, no 3D
 """
 
 import argparse
@@ -43,7 +42,9 @@ import anthropic
 import numpy as np
 from dotenv import load_dotenv
 
-load_dotenv()
+from .paths import DOTENV, out_path
+
+load_dotenv(DOTENV)
 
 MODEL = "claude-opus-5"
 
@@ -840,7 +841,7 @@ def media_type_for(path: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", help="use a local image instead of the camera")
-    ap.add_argument("--out", default="table_objects.json")
+    ap.add_argument("--out", default=out_path("table_objects.json"))
     args = ap.parse_args()
 
     if args.image:
@@ -851,13 +852,13 @@ def main() -> None:
               file=sys.stderr)
     else:
         frame = asyncio.run(grab_frame())
-        frame_path = "frame" + SUPPORTED_IMAGE_TYPES[frame.media_type]
+        frame_path = out_path("frame" + SUPPORTED_IMAGE_TYPES[frame.media_type])
         with open(frame_path, "wb") as f:
             f.write(frame.color)
 
     result, marked = scan(frame)
     if marked:
-        with open("frame_marked.jpg", "wb") as f:
+        with open(out_path("frame_marked.jpg"), "wb") as f:
             f.write(marked)
 
     with open(args.out, "w") as f:

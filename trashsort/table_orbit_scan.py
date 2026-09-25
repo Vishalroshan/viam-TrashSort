@@ -19,53 +19,51 @@ position toward the centroid: the camera looks at the object from the side,
 not just from above. Viam's orientation_vector encodes this as the unit
 "look-at" direction (o_x, o_y, o_z) plus a roll theta around it.
 
-Outputs
--------
+Outputs (all in output/)
+------------------------
   orbit_NN.jpg          — colour frame from each viewpoint (NN = pose index)
   orbit_cloud.ply       — full merged point cloud, world frame, mm
   orbit_object.ply      — points within ±CROP_PAD_MM of the object's bounding
                            box (strips the table and background)
   orbit_mesh.ply        — Poisson surface mesh (only with --reconstruct)
 
-Setup:
-    .venv/bin/pip install viam-sdk anthropic python-dotenv numpy pillow
-    .venv/bin/pip install open3d          # only needed for --reconstruct
+Setup: see README.md. --reconstruct additionally needs open3d.
 
-Run:
+Run, from the repo root:
     # use the objects from the last scan
-    .venv/bin/python table_orbit_scan.py
+    python -m trashsort.table_orbit_scan
 
     # specify a different scan file and a specific object
-    .venv/bin/python table_orbit_scan.py --objects table_objects_1.json --id obj1
+    python -m trashsort.table_orbit_scan --objects output/table_objects_1.json --id obj1
 
     # scan the table live first, then orbit the first trash object
-    .venv/bin/python table_orbit_scan.py --live-scan
+    python -m trashsort.table_orbit_scan --live-scan
 
     # print the planned orbit poses and exit — no arm motion
-    .venv/bin/python table_orbit_scan.py --dry-run
+    python -m trashsort.table_orbit_scan --dry-run
 
     # build a mesh too
-    .venv/bin/python table_orbit_scan.py --reconstruct
+    python -m trashsort.table_orbit_scan --reconstruct
 """
 
 import argparse
 import asyncio
 import json
 import math
-import os
 import sys
 from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
 
-load_dotenv()
-
-import table_scan as ts
-import table_cleanup as tc
+from . import table_scan as ts
+from . import table_cleanup as tc
+from .paths import DOTENV, out_path as _out
 from viam.components.arm import Arm
 from viam.proto.common import Pose, PoseInFrame
 from viam.services.motion import Motion
+
+load_dotenv(DOTENV)
 
 # ---------------------------------------------------------------------------
 # Orbit geometry
@@ -336,7 +334,7 @@ async def orbit_and_scan(
 
             # 4. Save colour image.
             ext = ts.SUPPORTED_IMAGE_TYPES.get(frame.media_type, ".jpg")
-            cpath = f"orbit_{i+1:02d}{ext}"
+            cpath = _out(f"orbit_{i+1:02d}{ext}")
             with open(cpath, "wb") as f:
                 f.write(frame.color)
             colour_paths.append(cpath)
@@ -381,7 +379,7 @@ def merge_and_save(clouds: list[np.ndarray], obj: dict) -> tuple[str, str | None
         merged = voxel_downsample(merged, VOXEL_MM)
         print(f"After voxel downsampling ({VOXEL_MM} mm): {len(merged):,} points")
 
-    full_path = "orbit_cloud.ply"
+    full_path = _out("orbit_cloud.ply")
     save_ply(merged, full_path)
 
     # Crop to object bounding box ± padding.
@@ -393,7 +391,7 @@ def merge_and_save(clouds: list[np.ndarray], obj: dict) -> tuple[str, str | None
         obj_cloud = merged[mask]
         print(f"Object crop (±{CROP_PAD_MM:.0f} mm): {len(obj_cloud):,} points")
         if len(obj_cloud) >= 50:
-            obj_path = "orbit_object.ply"
+            obj_path = _out("orbit_object.ply")
             save_ply(obj_cloud, obj_path)
 
     return full_path, obj_path
@@ -433,7 +431,7 @@ def reconstruct_mesh(ply_path: str) -> str | None:
     mesh.remove_vertices_by_mask(to_remove)
     mesh.compute_vertex_normals()
 
-    mesh_path = "orbit_mesh.ply"
+    mesh_path = _out("orbit_mesh.ply")
     o3d.io.write_triangle_mesh(mesh_path, mesh)
     print(f"  Mesh → {mesh_path} "
           f"({len(mesh.vertices):,} vertices, {len(mesh.triangles):,} triangles)")
@@ -466,9 +464,9 @@ def pick_object(data: dict, obj_id: str | None) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Orbit the arm around a detected object and build a 3D point cloud.")
-    ap.add_argument("--objects", default="table_objects.json",
+    ap.add_argument("--objects", default=_out("table_objects.json"),
                     help="Path to table_objects.json from a prior scan "
-                         "(default: table_objects.json)")
+                         "(default: output/table_objects.json)")
     ap.add_argument("--id", dest="obj_id", default=None,
                     help="Object id to orbit (default: first trash object)")
     ap.add_argument("--poses", type=int, default=N_POSES,
@@ -491,11 +489,11 @@ def main() -> None:
         print("Running live table scan first...")
         frame = asyncio.run(ts.grab_frame())
         ext = ts.SUPPORTED_IMAGE_TYPES[frame.media_type]
-        with open("frame" + ext, "wb") as f:
+        with open(_out("frame" + ext), "wb") as f:
             f.write(frame.color)
         result, marked = ts.scan(frame)
         if marked:
-            with open("frame_marked.jpg", "wb") as f:
+            with open(_out("frame_marked.jpg"), "wb") as f:
                 f.write(marked)
         with open(args.objects, "w") as f:
             json.dump(result, f, indent=2)

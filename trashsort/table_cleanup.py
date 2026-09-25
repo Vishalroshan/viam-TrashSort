@@ -27,12 +27,11 @@ risking a blind grasp.
 There is no confirmation prompt: this script scans and immediately acts on
 whatever it classifies as trash. Ctrl-C stops the arm where it is.
 
-Setup: same as table_scan.py — .env populated, .venv/bin/pip install
-       viam-sdk anthropic python-dotenv numpy pillow
+Setup: same as table_scan.py — see README.md.
 
-Run:
-    .venv/bin/python table_cleanup.py             # scan, then act
-    .venv/bin/python table_cleanup.py --dry-run    # scan, print the plan, touch nothing physical
+Run, from the repo root:
+    python -m trashsort.table_cleanup             # scan, then act
+    python -m trashsort.table_cleanup --dry-run   # scan, print the plan, touch nothing physical
 """
 
 import argparse
@@ -57,7 +56,8 @@ from viam.proto.common import (
 from viam.proto.service.motion import Constraints, LinearConstraint
 from viam.services.motion import Motion
 
-import table_scan as ts
+from . import table_scan as ts
+from .paths import out_path as _out
 
 # --- Frame-system facts, read off this machine's config --------------------
 
@@ -349,12 +349,12 @@ async def run(dry_run: bool, out_path: str) -> None:
         # logging it makes a drift between runs diagnosable.
         p = await arm.get_end_position()
         print(f"arm at capture: ({p.x:.1f}, {p.y:.1f}, {p.z:.1f})")
-        with open("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type], "wb") as f:
+        with open(_out("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type]), "wb") as f:
             f.write(frame.color)
 
         result, marked = ts.scan(frame)
         if marked:
-            with open("frame_marked.jpg", "wb") as f:
+            with open(_out("frame_marked.jpg"), "wb") as f:
                 f.write(marked)
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
@@ -441,7 +441,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
                      help="scan and print the plan; do not move the arm")
-    ap.add_argument("--out", default="table_objects.json")
+    ap.add_argument("--out", default=_out("table_objects.json"))
     args = ap.parse_args()
     asyncio.run(run(args.dry_run, args.out))
 

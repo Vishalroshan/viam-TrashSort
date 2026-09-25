@@ -25,11 +25,10 @@ objects' grasp points marked as red spheres + orange approach arrows.
 Stop halts the arm immediately, wherever it is. Clear arm error recovers the
 xArm after a collision fault.
 
-Setup: as table_cleanup.py, plus
-    .venv/bin/pip install PyQt5 open3d
+Setup: see README.md; the UI additionally needs PyQt5 and open3d.
 
-Run:
-    .venv/bin/python cleanup_ui.py
+Run, from the repo root:
+    python cleanup_ui.py
 """
 
 import asyncio
@@ -71,9 +70,10 @@ from viam.proto.common import WorldState
 from viam.proto.service.motion import Constraints, LinearConstraint
 from viam.services.motion import Motion
 
-import table_cleanup as tc
-import table_scan as ts
-import table_reconstruct as tr
+from trashsort import table_cleanup as tc
+from trashsort import table_scan as ts
+from trashsort import table_reconstruct as tr
+from trashsort.paths import out_path as _out
 
 INTERPRET_PROMPT = """You are the chat interface of a tabletop robot arm. The arm
 can pick objects up off the table and either drop them in a trash bin or set
@@ -387,13 +387,13 @@ class Robot:
         except Exception:
             self.machine = None
             raise
-        with open("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type], "wb") as f:
+        with open(_out("frame" + ts.SUPPORTED_IMAGE_TYPES[frame.media_type]), "wb") as f:
             f.write(frame.color)
         result, marked = await asyncio.to_thread(ts.scan, frame)
         if marked:
-            with open("frame_marked.jpg", "wb") as f:
+            with open(_out("frame_marked.jpg"), "wb") as f:
                 f.write(marked)
-        with open("table_objects.json", "w") as f:
+        with open(_out("table_objects.json"), "w") as f:
             json.dump(result, f, indent=2)
         return result, marked or frame.color
 

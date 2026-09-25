@@ -21,6 +21,20 @@ Positions are reported in the `world` frame. The camera rides on the arm, so
 camera-frame coordinates shift whenever the arm moves and aren't a stable
 description of where anything is.
 
+## Layout
+
+```
+trashsort/          the shared modules
+  table_scan.py         scan and classify — the foundation the rest build on
+  table_cleanup.py      pick up and bin whatever was classified as trash
+  table_orbit_scan.py   orbit one object for a dense point cloud
+  table_reconstruct.py  Poisson reconstruction + render (library for the UI)
+  paths.py              where generated files go
+cleanup_ui.py       PyQt5 chat window (entry point)
+examples/           standalone reference scripts
+output/             generated frames, scans, clouds and meshes (gitignored)
+```
+
 ## Setup
 
 ```bash
@@ -33,31 +47,32 @@ cp .env.example .env     # then fill it in
 [.env.example](.env.example) for each variable and where to get it. It is
 gitignored — keep credentials out of the source files.
 
-## Scripts
-
-| Script | What it does |
-| --- | --- |
-| `table_scan.py` | Scan the table and write `table_objects.json`: every object, its trash classification, and its world-frame position. The foundation the others build on. |
-| `table_cleanup.py` | Scan, then pick up everything classified as trash and drop it in a fixed location. Supports `--dry-run`. |
-| `cleanup_ui.py` | PyQt5 chat window — scan, then say what to remove in plain language ("get rid of all the trash except the paper"). |
-| `table_orbit_scan.py` | Orbit the arm around one object, fusing depth from several viewpoints into a dense point cloud (`orbit_cloud.ply`). |
-| `table_reconstruct.py` | Orbit scan + Poisson surface reconstruction + render, as a library for `cleanup_ui.py`. |
-| `viam_move_to_centroid.py` | Early standalone pick-and-place against a simple green-block segmenter. Kept for reference. |
-
-Each file's module docstring documents its own flags and outputs in detail.
-
 ## Running
 
+Run from the repo root:
+
 ```bash
-.venv/bin/python table_scan.py                  # scan only
-.venv/bin/python table_scan.py --image test.jpeg  # classify a photo, no 3D
-.venv/bin/python table_cleanup.py --dry-run     # scan, print the plan, move nothing
-.venv/bin/python table_cleanup.py               # scan and clear the table
-.venv/bin/python cleanup_ui.py                  # chat UI
+.venv/bin/python -m trashsort.table_scan                 # scan only
+.venv/bin/python -m trashsort.table_scan --image photo.jpg  # classify a photo, no 3D
+.venv/bin/python -m trashsort.table_cleanup --dry-run    # scan, print the plan, move nothing
+.venv/bin/python -m trashsort.table_cleanup              # scan and clear the table
+.venv/bin/python -m trashsort.table_orbit_scan           # orbit the last scan's first trash object
+.venv/bin/python cleanup_ui.py                           # chat UI
 ```
 
-`table_cleanup.py` has no confirmation prompt — it scans and immediately acts on
+`table_cleanup` has no confirmation prompt — it scans and immediately acts on
 whatever it classified as trash. Ctrl-C stops the arm where it is.
+
+Each module's docstring documents its own flags and outputs in detail.
+
+## Output
+
+Everything generated lands in `output/`, resolved relative to the repo rather
+than your shell's working directory, so it goes to the same place wherever you
+run from. `TRASHSORT_OUTPUT_DIR` redirects it; the `--out` and `--objects` flags
+override individual paths.
+
+`--image` takes any local photo. Sample images aren't versioned here.
 
 ## Notes
 
@@ -65,6 +80,3 @@ Objects whose depth signal is too sparse to trust are skipped and reported
 rather than blindly grasped. Clear plastic and shiny metal are the usual
 offenders under IR depth sensing; the water bottle on this table is the running
 example.
-
-Scan outputs (`frame*.jpg`, `table_objects*.json`, `*.ply`) are generated
-artifacts and are gitignored.

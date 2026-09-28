@@ -1,13 +1,20 @@
 # viam-TrashSort
 
+![Pipeline: photo, point-cloud clusters, visual reasoning about trash, grasp](docs/pipeline.png)
+
 An intelligent robotic arm that autonomously identifies, sorts, and removes trash from a tabletop using visual perception, contextual reasoning, and 3D object localization.
 The system captures images of the workspace and reasons about whether an object should be classified as trash based on its appearance and context. For example, a sealed soda can is not trash, an open can may still contain an unfinished drink, while a crushed can is a strong indicator of waste. Once trash is identified, the robot localizes each object in 3D, picks it up, and deposits it into a designated bin.
+
+<p align="center"><img src="docs/hero.gif" width="420" alt="The arm picks the napkin, bottle and crushed can off the table and leaves the keepers"></p>
 
 Beyond autonomous trash removal, the system provides an interactive user interface for object manipulation and workspace organization.
 
 - **Interactive Object Rearrangement:** When objects are too close together for reliable grasping, users can draw trajectories directly on the UI, guiding the robotic arm to push objects apart and create sufficient clearance.
 - **Language-Guided Manipulation:** Users can interact with the robot through a natural-language chat interface to specify which objects to pick up.
 - **Waypoint-Based Placement:** Once the trash has been cleared, users can reorganize their workspace by selecting target placement locations through the UI, allowing the robot to pick and place objects as desired.
+
+![The arm sweeping a soda can aside with its gripper closed](docs/push.gif)
+
 The project combines visual reasoning, 3D perception, robotic manipulation, and human-in-the-loop control to transform a cluttered tabletop into an organized workspace.
 
 Built on a [Viam](https://www.viam.com/) machine — an xArm with a wrist-mounted

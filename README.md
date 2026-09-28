@@ -1,5 +1,7 @@
 # viam-TrashSort
 
+![Pipeline: photo, point-cloud clusters, visual reasoning about trash, grasp](docs/pipeline.png)
+
 A robot arm that clears a table: it photographs what's on the surface, asks
 Claude which items are trash, locates each one in 3D, and picks the trash up.
 
@@ -20,6 +22,16 @@ places, each doing what it is good at:
 Positions are reported in the `world` frame. The camera rides on the arm, so
 camera-frame coordinates shift whenever the arm moves and aren't a stable
 description of where anything is.
+
+<p align="center"><img src="docs/hero.gif" width="420" alt="The arm picks the napkin, bottle and crushed can off the table and leaves the keepers"></p>
+
+## Beyond picking trash
+
+The chat UI can also push things it can't grasp — drag a path across the live
+feed and the arm sweeps along it with the gripper closed — and move an object
+to a point you click.
+
+![The arm sweeping a soda can aside with its gripper closed](docs/push.gif)
 
 ## Layout
 
